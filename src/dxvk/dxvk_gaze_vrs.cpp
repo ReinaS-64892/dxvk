@@ -21,8 +21,6 @@
 namespace dxvk
 {
 
-  static constexpr uint32_t GazeMagic = 0x455a4147u; // "GAZE"
-
   static float getEnvFloat(const char *name, float fallback)
   {
     std::string v = env::getEnvVar(name);
@@ -84,7 +82,7 @@ namespace dxvk
     m_onlySamples = uint32_t(getEnvFloat("DXVK_GAZE_SAMPLES", 0.0f));
     m_onlyFormat = uint32_t(getEnvFloat("DXVK_GAZE_FMT", 0.0f));
 
-    // DXVK_GAZE_FAKE=x|y|circle: ignore WiVRn and sweep a synthetic gaze (6 s period)
+    // DXVK_GAZE_FAKE=x|y|circle: ignore OpenXR gaze and sweep a synthetic gaze (6 s period)
     {
       std::string fake = env::getEnvVar("DXVK_GAZE_FAKE");
       m_fake = fake == "x" ? 1 : fake == "y"    ? 2
@@ -122,7 +120,7 @@ namespace dxvk
       std::sscanf(forced.c_str(), "%ux%u", &m_forceW, &m_forceH);
 
     if (m_path.empty())
-      m_path = "Z:\\dev\\shm\\wivrn_gaze";
+      m_path = "Z:\\dev\\shm\\vrchat_dfr_gaze";
 
     m_ok = createResources();
 
@@ -135,14 +133,7 @@ namespace dxvk
 
   DxvkGazeVrs::~DxvkGazeVrs()
   {
-#ifdef _WIN32
-    if (m_shm)
-      UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
-    if (m_map)
-      CloseHandle(HANDLE(m_map));
-    if (m_file)
-      CloseHandle(HANDLE(m_file));
-#endif
+    closeSource();
   }
 
   bool DxvkGazeVrs::createResources()
@@ -256,7 +247,7 @@ namespace dxvk
       return;
     }
 
-    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(GazeShm));
 
     if (!view)
     {
@@ -267,62 +258,52 @@ namespace dxvk
 
     m_file = file;
     m_map = map;
-    m_shm = static_cast<const volatile GazeShm *>(view);
+    m_shm = static_cast<const GazeShm *>(view);
+    m_sourceFreshness = gaze_bridge::Freshness{};
 
     Logger::info("GazeVRS: gaze source opened");
 #endif
   }
 
+  void DxvkGazeVrs::closeSource()
+  {
+#ifdef _WIN32
+    if (m_shm) UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
+    if (m_map) CloseHandle(HANDLE(m_map));
+    if (m_file) CloseHandle(HANDLE(m_file));
+#endif
+    m_shm = nullptr;
+    m_map = nullptr;
+    m_file = nullptr;
+  }
+
   bool DxvkGazeVrs::readGaze(Gaze &g)
   {
     if (!m_shm)
-    {
       openSource();
+    if (!m_shm)
+      return false;
 
-      if (!m_shm)
-        return false;
-    }
-
-    for (uint32_t i = 0; i < 4u; i++)
+    const auto now = std::chrono::steady_clock::now();
+    gaze_bridge::Sample sample;
+    uint32_t sequence = 0;
+    if (gaze_bridge::snapshot(m_shm, sample, sequence)
+        && m_sourceFreshness.observe(sequence, now) && sample.valid)
     {
-      uint32_t s1 = m_shm->seq;
-
-      if (s1 & 1u)
-        continue;
-
-      std::atomic_thread_fence(std::memory_order_acquire);
-
-      uint32_t magic = m_shm->magic;
-      uint32_t valid = m_shm->valid;
-
-      for (uint32_t e = 0; e < 2u; e++)
+      for (uint32_t eye = 0; eye < 2; eye++)
       {
-        g.cx[e] = m_shm->cx[e];
-        g.cy[e] = m_shm->cy[e];
-        g.flipX[e] = m_shm->flipX[e];
-        g.flipY[e] = m_shm->flipY[e];
+        g.cx[eye] = sample.u[eye];
+        g.cy[eye] = sample.v[eye];
+        g.flipX[eye] = 0;
+        g.flipY[eye] = 0;
       }
-
-      std::atomic_thread_fence(std::memory_order_acquire);
-
-      if (s1 != m_shm->seq)
-        continue;
-
-      if (magic != GazeMagic || !valid)
-        return false;
-
-      for (uint32_t e = 0; e < 2u; e++)
-      {
-        if (!std::isfinite(g.cx[e]) || !std::isfinite(g.cy[e]))
-          return false;
-
-        g.cx[e] = std::clamp(g.cx[e], 0.0f, 1.0f);
-        g.cy[e] = std::clamp(g.cy[e], 0.0f, 1.0f);
-      }
-
       return true;
     }
 
+    // Includes a writer killed during an odd sequence, and replaced files.
+    // Never keep using the last valid packet after the heartbeat stops.
+    if (m_sourceFreshness.expired(now))
+      closeSource();
     return false;
   }
 

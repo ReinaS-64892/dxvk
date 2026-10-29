@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dxvk_gaze_shm.h"
+
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -33,17 +35,7 @@ namespace dxvk
         VkRenderingFragmentShadingRateAttachmentInfoKHR &info);
 
   private:
-    // Must match gaze_shm_data in WiVRn's foveation.cpp
-    struct GazeShm
-    {
-      uint32_t magic; // 'GAZE'
-      uint32_t seq;   // even = stable
-      float cx[2];    // fovea center, fraction of eye width,  display space
-      float cy[2];    // fovea center, fraction of eye height, display space, from top
-      uint32_t valid;
-      int32_t flipX[2]; // source rect has negative width
-      int32_t flipY[2]; // source rect has negative height
-    };
+    using GazeShm = gaze_bridge::SharedGaze;
 
     struct Gaze
     {
@@ -70,8 +62,9 @@ namespace dxvk
 
     void *m_file = nullptr;
     void *m_map = nullptr;
-    const volatile GazeShm *m_shm = nullptr;
+    const GazeShm *m_shm = nullptr;
     std::chrono::steady_clock::time_point m_nextOpen = {};
+    gaze_bridge::Freshness m_sourceFreshness;
 
     uint32_t m_lastTilesX = 0u;
     uint32_t m_lastTilesY = 0u;
@@ -91,7 +84,7 @@ namespace dxvk
     uint32_t m_minSize = 700u;
     bool m_flipY = false; // extra global Y flip
     bool m_swapEyes = false;
-    int m_forceFlipX[2] = {-1, -1}; // -1 = use WiVRn's value
+    int m_forceFlipX[2] = {-1, -1}; // -1 = use source default
     int m_forceFlipY[2] = {-1, -1};
     bool m_debug = false;
     bool m_dot = false;
@@ -116,6 +109,7 @@ namespace dxvk
 
     bool createResources();
     void openSource();
+    void closeSource();
     bool readGaze(Gaze &g);
   };
 
