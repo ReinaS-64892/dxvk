@@ -1,4 +1,5 @@
 #include "dxvk_device.h"
+#include "dxvk_gaze_vrs.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_shader.h"
 #include "dxvk_shader_io.h"
@@ -375,6 +376,9 @@ namespace dxvk {
     if (m_device->features().extExtendedDynamicState3.extendedDynamicState3DepthClipEnable)
       dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT);
 
+    if (dxvkGazeVrsEnabled(m_device))
+      dynamicStates.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
+
     VkPipelineDynamicStateCreateInfo dyInfo = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     dyInfo.dynamicStateCount  = dynamicStates.size();
     dyInfo.pDynamicStates     = dynamicStates.data();
@@ -486,6 +490,9 @@ namespace dxvk {
       dynamicStates.push_back(VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT);
       dynamicStates.push_back(VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT);
     }
+
+    if (dxvkGazeVrsEnabled(m_device))
+      dynamicStates.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
 
     VkPipelineDynamicStateCreateInfo dyInfo = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     dyInfo.dynamicStateCount  = dynamicStates.size();

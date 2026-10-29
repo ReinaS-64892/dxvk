@@ -179,6 +179,10 @@ namespace dxvk::vk {
     #ifdef VK_EXT_sample_locations
     VULKAN_FN(vkGetPhysicalDeviceMultisamplePropertiesEXT);
     #endif
+
+    #ifdef VK_KHR_fragment_shading_rate
+    VULKAN_FN(vkGetPhysicalDeviceFragmentShadingRatesKHR);
+    #endif
   };
   
   
@@ -456,6 +460,10 @@ namespace dxvk::vk {
 
     #ifdef VK_EXT_sample_locations
     VULKAN_FN(vkCmdSetSampleLocationsEXT);
+    #endif
+
+    #ifdef VK_KHR_fragment_shading_rate
+    VULKAN_FN(vkCmdSetFragmentShadingRateKHR);
     #endif
 
     #ifdef VK_EXT_shader_module_identifier

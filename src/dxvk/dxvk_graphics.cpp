@@ -3,6 +3,7 @@
 #include "../util/util_time.h"
 
 #include "dxvk_device.h"
+#include "dxvk_gaze_vrs.h"
 #include "dxvk_graphics.h"
 #include "dxvk_pipemanager.h"
 
@@ -502,6 +503,9 @@ namespace dxvk {
     if (state.cbUseDynamicBlendConstants)
       dynamicStates.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
 
+    if (dxvkGazeVrsEnabled(m_device))
+      dynamicStates.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
+
     VkPipelineDynamicStateCreateInfo dyInfo = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 
     if (!dynamicStates.empty()) {
@@ -820,6 +824,9 @@ namespace dxvk {
         dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
       }
     }
+
+    if (dxvkGazeVrsEnabled(device))
+      dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
 
     if (dyInfo.dynamicStateCount)
       dyInfo.pDynamicStates = dyStates.data();

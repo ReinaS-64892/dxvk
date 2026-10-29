@@ -7,6 +7,7 @@
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+#include "dxvk_gaze_dot.h"
 
 namespace dxvk {
   
@@ -6564,7 +6565,51 @@ namespace dxvk {
 
       m_cmd->beginSecondaryCommandBuffer(inheritance);
     } else {
-      // Begin rendering right away on regular GPUs
+      // Gaze-driven VRS: attach a shading rate image to eye passes
+      bool gazeVrsActive = false;
+
+      if (dxvkGazeVrsEnabled(m_device.ptr())) {
+        if (!m_gazeVrs)
+          m_gazeVrs = std::make_unique<DxvkGazeVrs>(m_device.ptr());
+
+        auto& gazeInfo = m_state.om.renderingInfo.gazeVrs;
+        gazeInfo = { VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR };
+
+        const auto& gazeColor = framebufferInfo.getColorTarget(0u);
+
+        gazeVrsActive = m_gazeVrs->prepare(m_cmd.ptr(),
+          VkExtent2D { fbSize.width, fbSize.height }, fbSize.layers,
+          gazeColor.view ? gazeColor.view->info().format : VK_FORMAT_UNDEFINED,
+          gazeColor.view ? gazeColor.view->image()->info().sampleCount : VK_SAMPLE_COUNT_1_BIT,
+          gazeInfo);
+
+        if (gazeVrsActive) {
+          renderingInfo.pNext = &gazeInfo;
+
+          static uint32_t gazeVpLogCount = 0u;
+
+          if (gazeVpLogCount < 20u) {
+            gazeVpLogCount++;
+
+            const auto& gvp = m_state.vp.viewports[0];
+            const auto& gsc = m_state.vp.scissorRects[0];
+
+            Logger::info(str::format("GazeVRS: pass fb ", fbSize.width, "x", fbSize.height,
+              " viewport(x=", gvp.x, " y=", gvp.y, " w=", gvp.width, " h=", gvp.height, ")",
+              " scissor(x=", gsc.offset.x, " y=", gsc.offset.y, " w=", gsc.extent.width, " h=", gsc.extent.height, ")",
+              " viewports=", m_state.vp.viewportCount));
+          }
+        }
+      }
+
+      if (m_gazeVrs) {
+        VkExtent2D fragmentSize = { 1u, 1u };
+        VkFragmentShadingRateCombinerOpKHR combiner[2] = {
+          VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+          VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR };
+        m_cmd->cmdSetFragmentShadingRate(&fragmentSize, combiner);
+      }
+
       m_cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderingInfo);
     }
 
@@ -6612,6 +6657,38 @@ namespace dxvk {
       auto& renderingInfo = m_state.om.renderingInfo.rendering;
       m_cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderingInfo);
       m_cmd->cmdExecuteCommands(1, &cmdBuffer);
+    }
+
+    if (g_gazeDot.passActive) {
+      g_gazeDot.passActive = false;
+
+      for (uint32_t i = 0u; i < g_gazeDot.count && i < 16u; i++) {
+        const auto& d = g_gazeDot.dots[i];
+
+        int32_t x0 = std::max(0, d.x - d.r);
+        int32_t y0 = std::max(0, d.y - d.r);
+        int32_t x1 = std::min(g_gazeDot.width,  d.x + d.r);
+        int32_t y1 = std::min(g_gazeDot.height, d.y + d.r);
+
+        if (x1 <= x0 || y1 <= y0)
+          continue;
+
+        VkClearAttachment dotClear = { };
+        dotClear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        dotClear.colorAttachment = 0u;
+        dotClear.clearValue.color.float32[0] = d.rgb[0];
+        dotClear.clearValue.color.float32[1] = d.rgb[1];
+        dotClear.clearValue.color.float32[2] = d.rgb[2];
+        dotClear.clearValue.color.float32[3] = 1.0f;
+
+        VkClearRect dotRect = { };
+        dotRect.rect.offset = { x0, y0 };
+        dotRect.rect.extent = { uint32_t(x1 - x0), uint32_t(y1 - y0) };
+        dotRect.baseArrayLayer = 0u;
+        dotRect.layerCount = 1u;
+
+        m_cmd->cmdClearAttachments(DxvkCmdBuffer::ExecBuffer, 1, &dotClear, 1, &dotRect);
+      }
     }
 
     // End actual rendering command

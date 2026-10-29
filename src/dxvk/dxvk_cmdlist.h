@@ -1094,6 +1094,13 @@ namespace dxvk {
     }
 
 
+    void cmdSetFragmentShadingRate(
+      const VkExtent2D*                 fragmentSize,
+      const VkFragmentShadingRateCombinerOpKHR* combinerOps) {
+      m_vkd->vkCmdSetFragmentShadingRateKHR(getCmdBuffer(), fragmentSize, combinerOps);
+    }
+
+
     void cmdSetDepthBias(
             float                   depthBiasConstantFactor,
             float                   depthBiasClamp,
