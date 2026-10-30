@@ -126,6 +126,7 @@ namespace dxvk
 
     Logger::info(str::format("GazeVRS: init ", m_ok ? "ok" : "FAILED",
                              ", texel ", m_texel.width, "x", m_texel.height,
+                             ", max tiles ", m_maxTiles.width, "x", m_maxTiles.height,
                              ", r1=", m_r1, " r2=", m_r2, ", full_area=", m_fullArea,
                              ", mid_area=", m_midArea, ", coarse=", coarse,
                              ", file=", m_path));
@@ -146,6 +147,12 @@ namespace dxvk
     if (fsrProps.minFragmentShadingRateAttachmentTexelSize.width && fsrProps.minFragmentShadingRateAttachmentTexelSize.height)
       m_texel = fsrProps.minFragmentShadingRateAttachmentTexelSize;
 
+    // Preserve the 8192-pixel coverage of 512 tiles at 16x16 texels on
+    // devices with smaller attachment texels, without reducing the old capacity.
+    const uint32_t maxImageSize = m_device->properties().core.properties.limits.maxImageDimension2D;
+    m_maxTiles.width = std::min(maxImageSize, std::max(512u, (8192u + m_texel.width - 1u) / m_texel.width));
+    m_maxTiles.height = std::min(maxImageSize, std::max(512u, (8192u + m_texel.height - 1u) / m_texel.height));
+
     auto findType = [&](uint32_t bits, VkMemoryPropertyFlags flags) -> int32_t
     {
       for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
@@ -159,7 +166,7 @@ namespace dxvk
     VkImageCreateInfo imageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = VK_FORMAT_R8_UINT;
-    imageInfo.extent = {MaxTiles, MaxTiles, 1u};
+    imageInfo.extent = {m_maxTiles.width, m_maxTiles.height, 1u};
     imageInfo.mipLevels = 1u;
     imageInfo.arrayLayers = MaxLayers;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -195,7 +202,9 @@ namespace dxvk
       return false;
 
     VkBufferCreateInfo bufferInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bufferInfo.size = VkDeviceSize(MaxTiles) * MaxTiles * MaxLayers;
+    // Each layer starts at a four-byte aligned offset in the upload buffer.
+    const VkDeviceSize layerStride = (VkDeviceSize(m_maxTiles.width) * m_maxTiles.height + 3u) & ~VkDeviceSize(3u);
+    bufferInfo.size = layerStride * MaxLayers;
     bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -446,7 +455,7 @@ namespace dxvk
     const uint32_t tilesX = (extent.width + m_texel.width - 1u) / m_texel.width;
     const uint32_t tilesY = (extent.height + m_texel.height - 1u) / m_texel.height;
 
-    if (tilesX > MaxTiles || tilesY > MaxTiles)
+    if (tilesX > m_maxTiles.width || tilesY > m_maxTiles.height)
       return false;
 
     Gaze g = {};

@@ -45,7 +45,6 @@ namespace dxvk
       int32_t flipY[2];
     };
 
-    static constexpr uint32_t MaxTiles = 512u;
     static constexpr uint32_t MaxLayers = 2u;
 
     DxvkDevice *m_device = nullptr;
@@ -59,6 +58,7 @@ namespace dxvk
     bool m_layoutInit = false;
 
     VkExtent2D m_texel = {16u, 16u};
+    VkExtent2D m_maxTiles = {512u, 512u};
 
     void *m_file = nullptr;
     void *m_map = nullptr;
