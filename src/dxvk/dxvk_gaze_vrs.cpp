@@ -1,6 +1,4 @@
 #include <algorithm>
-#include <atomic>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -9,31 +7,36 @@
 #include "dxvk_device.h"
 #include "dxvk_gaze_dot.h"
 #include "dxvk_gaze_vrs.h"
+#include "dxvk_gaze_source.h"
 
 #include "../util/log/log.h"
 #include "../util/util_env.h"
 #include "../util/util_string.h"
 
-#ifdef _WIN32
-#include "../util/util_win32_compat.h"
-#endif
-
 namespace dxvk
 {
+
+  // Keep worker implementation and source ownership out of the rendering
+  // header. Destruction joins the worker before closing its source mapping.
+  struct DxvkGazeVrs::Worker
+  {
+    DxvkGazeSource source;
+    struct Generator
+    {
+      DxvkGazeSource *source;
+      bool operator()(const GazeMapRequest &pass, GazeMap &result) const
+      { return source->generate(pass, result); }
+    };
+    GazeMapWorker<dxvk::thread, dxvk::mutex, dxvk::condition_variable, Generator> maps;
+    Worker()
+    : maps([] { env::setThreadName("dxvk-gaze-map"); },
+        Generator{&source}, std::chrono::milliseconds(4)) { }
+  };
 
   static float getEnvFloat(const char *name, float fallback)
   {
     std::string v = env::getEnvVar(name);
     return v.empty() ? fallback : float(std::atof(v.c_str()));
-  }
-
-  // -1 = unset, 0 / 1 = forced
-  static int getEnvTri(const char *name)
-  {
-    std::string v = env::getEnvVar(name);
-    if (v.empty())
-      return -1;
-    return v == "1" ? 1 : 0;
   }
 
   static uint32_t getFragmentRateCode(VkExtent2D size)
@@ -71,27 +74,14 @@ namespace dxvk
     m_fullArea = getEnvFloat("DXVK_GAZE_FULL_AREA", m_fullArea);
     m_midArea = getEnvFloat("DXVK_GAZE_MID_AREA", m_midArea);
     m_minSize = uint32_t(getEnvFloat("DXVK_GAZE_MINSIZE", float(m_minSize)));
-    m_flipY = env::getEnvVar("DXVK_GAZE_FLIP_Y") == "1";
-    m_swapEyes = env::getEnvVar("DXVK_GAZE_SWAP_EYES") == "1";
     m_debug = env::getEnvVar("DXVK_GAZE_DEBUG") == "1";
     m_dot = env::getEnvVar("DXVK_GAZE_DOT") == "1";
     m_dotRadius = int32_t(getEnvFloat("DXVK_GAZE_DOT_RADIUS", float(m_dotRadius)));
-    m_path = env::getEnvVar("DXVK_GAZE_FILE");
 
-    m_gainY = getEnvFloat("DXVK_GAZE_GAIN_Y", 1.0f);
     m_onlySamples = uint32_t(getEnvFloat("DXVK_GAZE_SAMPLES", 0.0f));
     m_onlyFormat = uint32_t(getEnvFloat("DXVK_GAZE_FMT", 0.0f));
 
-    // DXVK_GAZE_FAKE=x|y|circle: ignore OpenXR gaze and sweep a synthetic gaze (6 s period)
-    {
-      std::string fake = env::getEnvVar("DXVK_GAZE_FAKE");
-      m_fake = fake == "x" ? 1 : fake == "y"    ? 2
-                             : fake == "circle" ? 3
-                             : fake == "fixed"  ? 4
-                             : fake == "grid"   ? 5
-                                                : 0;
-      m_fixedY = getEnvFloat("DXVK_GAZE_FIXED_Y", m_fixedY);
-    }
+    m_grid = env::getEnvVar("DXVK_GAZE_FAKE") == "grid";
 
     // Raw shading rate code for the outer zone: (log2(w) << 2) | log2(h)
     // 5 = 2x2, 6 = 2x4, 9 = 4x2, 10 = 4x4.
@@ -110,31 +100,25 @@ namespace dxvk
       m_coarse = uint32_t(std::atof(coarse.c_str()));
     }
 
-    m_forceFlipX[0] = getEnvTri("DXVK_GAZE_FLIPX_L");
-    m_forceFlipX[1] = getEnvTri("DXVK_GAZE_FLIPX_R");
-    m_forceFlipY[0] = getEnvTri("DXVK_GAZE_FLIPY_L");
-    m_forceFlipY[1] = getEnvTri("DXVK_GAZE_FLIPY_R");
-
     std::string forced = env::getEnvVar("DXVK_GAZE_SIZE");
     if (!forced.empty())
       std::sscanf(forced.c_str(), "%ux%u", &m_forceW, &m_forceH);
 
-    if (m_path.empty())
-      m_path = "Z:\\dev\\shm\\vrchat_dfr_gaze";
-
     m_ok = createResources();
+    if (m_ok)
+      m_mapWorker = std::make_unique<Worker>();
 
     Logger::info(str::format("GazeVRS: init ", m_ok ? "ok" : "FAILED",
                              ", double-buffered, texel ", m_texel.width, "x", m_texel.height,
                              ", max tiles ", m_maxTiles.width, "x", m_maxTiles.height,
                              ", r1=", m_r1, " r2=", m_r2, ", full_area=", m_fullArea,
                              ", mid_area=", m_midArea, ", coarse=", coarse,
-                             ", file=", m_path));
+                             ", async map worker"));
   }
 
   DxvkGazeVrs::~DxvkGazeVrs()
   {
-    closeSource();
+    m_mapWorker.reset();
   }
 
   DxvkGazeVrs::Slot::~Slot()
@@ -237,97 +221,6 @@ namespace dxvk
     }
 
     return true;
-  }
-
-  void DxvkGazeVrs::openSource()
-  {
-#ifdef _WIN32
-    auto now = std::chrono::steady_clock::now();
-
-    if (now < m_nextOpen)
-      return;
-
-    m_nextOpen = now + std::chrono::seconds(2);
-
-    HANDLE file = CreateFileA(m_path.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-
-    if (file == INVALID_HANDLE_VALUE)
-      return;
-
-    if (GetFileSize(file, nullptr) < sizeof(GazeShm))
-    {
-      CloseHandle(file);
-      return;
-    }
-
-    HANDLE map = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-
-    if (!map)
-    {
-      CloseHandle(file);
-      return;
-    }
-
-    void *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(GazeShm));
-
-    if (!view)
-    {
-      CloseHandle(map);
-      CloseHandle(file);
-      return;
-    }
-
-    m_file = file;
-    m_map = map;
-    m_shm = static_cast<const GazeShm *>(view);
-    m_sourceFreshness = gaze_bridge::Freshness{};
-
-    Logger::info("GazeVRS: gaze source opened");
-#endif
-  }
-
-  void DxvkGazeVrs::closeSource()
-  {
-#ifdef _WIN32
-    if (m_shm) UnmapViewOfFile(const_cast<GazeShm *>(m_shm));
-    if (m_map) CloseHandle(HANDLE(m_map));
-    if (m_file) CloseHandle(HANDLE(m_file));
-#endif
-    m_shm = nullptr;
-    m_map = nullptr;
-    m_file = nullptr;
-  }
-
-  bool DxvkGazeVrs::readGaze(Gaze &g)
-  {
-    if (!m_shm)
-      openSource();
-    if (!m_shm)
-      return false;
-
-    const auto now = std::chrono::steady_clock::now();
-    gaze_bridge::Sample sample;
-    uint32_t sequence = 0;
-    if (gaze_bridge::snapshot(m_shm, sample, sequence)
-        && m_sourceFreshness.observe(sequence, now) && sample.valid)
-    {
-      for (uint32_t eye = 0; eye < 2; eye++)
-      {
-        g.cx[eye] = sample.u[eye];
-        g.cy[eye] = sample.v[eye];
-        g.flipX[eye] = 0;
-        g.flipY[eye] = 0;
-      }
-      return true;
-    }
-
-    // Includes a writer killed during an odd sequence, and replaced files.
-    // Never keep using the last valid packet after the heartbeat stops.
-    if (m_sourceFreshness.expired(now))
-      closeSource();
-    return false;
   }
 
   bool DxvkGazeVrs::prepare(
@@ -472,99 +365,8 @@ namespace dxvk
     if (tilesX > m_maxTiles.width || tilesY > m_maxTiles.height)
       return false;
 
-    Gaze g = {};
-
-    if (m_fake)
-    {
-      float t = std::chrono::duration<float>(now.time_since_epoch()).count();
-      float a = 0.35f * std::sin(t * 6.2831853f / 6.0f);
-      float b = 0.35f * std::cos(t * 6.2831853f / 6.0f);
-      float x = 0.5f, y = 0.5f;
-
-      if (m_fake == 1)
-        x += a;
-      else if (m_fake == 2)
-        y += a;
-      else if (m_fake == 4)
-        y = m_fixedY; // fixed spot, no motion
-      else if (m_fake == 5)
-      {
-      } // grid: fixed center
-      else
-      {
-        x += a;
-        y += b;
-      }
-
-      for (uint32_t e = 0; e < 2u; e++)
-      {
-        g.cx[e] = x;
-        g.cy[e] = y;
-      }
-    }
-    else if (!readGaze(g))
-    {
-      if (m_debug && !m_loggedNoGaze)
-      {
-        m_loggedNoGaze = true;
-        Logger::info("GazeVRS: candidate pass but no valid gaze data");
-      }
-      return false;
-    }
-
-    for (uint32_t e = 0; e < 2u; e++)
-    {
-      m_winMin[e] = std::min(m_winMin[e], g.cy[e]);
-      m_winMax[e] = std::max(m_winMax[e], g.cy[e]);
-      m_winMinX[e] = std::min(m_winMinX[e], g.cx[e]);
-      m_winMaxX[e] = std::max(m_winMaxX[e], g.cx[e]);
-    }
-
-    if (m_gainY != 1.0f)
-    {
-      for (uint32_t e = 0; e < 2u; e++)
-        g.cy[e] = std::clamp(0.5f + (g.cy[e] - 0.5f) * m_gainY, 0.0f, 1.0f);
-    }
-
-    if (m_swapEyes)
-    {
-      std::swap(g.cx[0], g.cx[1]);
-      std::swap(g.cy[0], g.cy[1]);
-      std::swap(g.flipX[0], g.flipX[1]);
-      std::swap(g.flipY[0], g.flipY[1]);
-    }
-
-    // Fovea position per eye in framebuffer space (0..1, origin top-left of the eye image).
-    // WiVRn reports display space and tells us whether the source image is mirrored.
-    float fx[2], fy[2];
-    uint32_t flags = 0u;
-
-    for (uint32_t e = 0; e < 2u; e++)
-    {
-      bool flipX = m_forceFlipX[e] >= 0 ? m_forceFlipX[e] != 0 : g.flipX[e] != 0;
-      bool flipY = m_forceFlipY[e] >= 0 ? m_forceFlipY[e] != 0 : g.flipY[e] != 0;
-
-      if (m_flipY)
-        flipY = !flipY;
-
-      fx[e] = flipX ? 1.0f - g.cx[e] : g.cx[e];
-      fy[e] = flipY ? 1.0f - g.cy[e] : g.cy[e];
-
-      flags |= (flipX ? 1u : 0u) << (e * 2u) | (flipY ? 1u : 0u) << (e * 2u + 1u);
-    }
-
     const uint32_t usedLayers = sbs ? 1u : MaxLayers;
     const float eyeW = sbs ? float(extent.width) * 0.5f : float(extent.width);
-
-    const std::array<int32_t, 4> center = {
-        int32_t(fx[0] * eyeW), int32_t(fy[0] * float(extent.height)),
-        int32_t(fx[1] * eyeW), int32_t(fy[1] * float(extent.height))};
-
-    // Quantize to tile granularity so we only re-upload when something visible changes
-    const std::array<int32_t, 4> centerTiles = {
-        center[0] / int32_t(m_texel.width), center[1] / int32_t(m_texel.height),
-        center[2] / int32_t(m_texel.width), center[3] / int32_t(m_texel.height)};
-
     const std::array<uint32_t, 5> shape = {
         extent.width, extent.height, usedLayers, uint32_t(colorFormat), uint32_t(samples)};
 
@@ -589,88 +391,44 @@ namespace dxvk
       cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dep);
     }
 
-    const bool changed = m_buffers.active < 0 || m_slots[m_buffers.active]->shape != shape
-        || m_slots[m_buffers.active]->flags != flags || m_slots[m_buffers.active]->coarse != coarse
-        || m_slots[m_buffers.active]->center != centerTiles;
-    const int32_t back = m_buffers.writable(completed);
-    const bool upload = changed && back >= 0;
+    GazeMapRequest request;
+    request.shape = shape;
+    request.texel = {m_texel.width, m_texel.height};
+    request.coarse = coarse;
+    request.r1 = m_r1;
+    request.r2 = m_r2;
+    request.fullArea = m_fullArea;
+    request.midArea = m_midArea;
 
-    if (m_debug && now >= m_nextGazeLog)
+    if (m_mapWorker->maps.failed())
     {
-      m_nextGazeLog = now + std::chrono::seconds(1);
-      Logger::info(str::format("GazeVRS: ", sbs ? "sbs " : "array ", extent.width, "x", extent.height,
-                               " display L(", g.cx[0], ",", g.cy[0], ") R(", g.cx[1], ",", g.cy[1], ")",
-                               " wivrn flipX=", g.flipX[0], g.flipX[1], " flipY=", g.flipY[0], g.flipY[1],
-                               " -> fb L(", fx[0], ",", fy[0], ") R(", fx[1], ",", fy[1], ")",
-                               " tiles ", tilesX, "x", tilesY));
-      Logger::info(str::format("GazeVRS: raw range last 1s: cx L[", m_winMinX[0], ",", m_winMaxX[0],
-                               "] R[", m_winMinX[1], ",", m_winMaxX[1], "]  cy L[", m_winMin[0], ",", m_winMax[0],
-                               "] R[", m_winMin[1], ",", m_winMax[1], "]  gainY=", m_gainY));
-
-      for (uint32_t e = 0; e < 2u; e++)
+      if (!m_loggedWorkerFailure)
       {
-        m_winMin[e] = m_winMinX[e] = 1.0f;
-        m_winMax[e] = m_winMaxX[e] = 0.0f;
+        Logger::err("GazeVRS: map worker failed; disabling VRS");
+        m_loggedWorkerFailure = true;
       }
+      return false;
     }
+    m_mapWorker->maps.exchange(request, true, m_cpuMap);
+    const int32_t back = m_buffers.writable(completed);
+    // A completed map can lag behind gaze, but must match this render target.
+    // Do not upload a map already displayed or already pending on the GPU.
+    auto matches = [&](const Rc<Slot> &slot) {
+      return slot->shape == m_cpuMap->request.shape && slot->flags == m_cpuMap->request.flags
+          && slot->coarse == m_cpuMap->request.coarse && slot->center == m_cpuMap->request.center;
+    };
+    const bool upload = back >= 0 && m_cpuMap && m_cpuMap->valid
+        && m_cpuMap->request.shape == shape && m_cpuMap->request.coarse == coarse
+        && (m_buffers.active < 0 || !matches(m_slots[m_buffers.active]));
 
     VkImageSubresourceRange allLayers = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, MaxLayers};
 
     if (upload)
     {
       auto &slot = m_slots[back];
-      const uint32_t tileCount = tilesX * tilesY;
-      const uint32_t layerStride = (tileCount + 3u) & ~3u;
-      std::vector<uint8_t> data(size_t(layerStride) * usedLayers, 0u);
-
-      const uint32_t mid = std::min<uint32_t>(5u, coarse);
-
-      // Radii are in units of min(eye width, eye height). If an area percentage is set, convert it: area = pi * R^2 * min^2  ->  R = sqrt(area * W * H / pi) / min
-      const float eyeH = float(extent.height);
-      const float minDim = std::min(eyeW, eyeH);
-
-      auto areaToRadius = [&](float percent)
-      {
-        float a = std::clamp(percent, 0.0f, 100.0f) * 0.01f;
-        if (a >= 1.0f)
-          return 10.0f; // 100% = whole eye, corners included
-        return std::sqrt(a * eyeW * eyeH / 3.14159265f) / minDim;
-      };
-
-      const float r1 = m_fullArea >= 0.0f ? areaToRadius(m_fullArea) : m_r1;
-      const float r2 = m_midArea >= 0.0f ? areaToRadius(m_midArea) : m_r2;
-
-      for (uint32_t l = 0; l < usedLayers; l++)
-      {
-        for (uint32_t ty = 0; ty < tilesY; ty++)
-        {
-          for (uint32_t tx = 0; tx < tilesX; tx++)
-          {
-            float px = (float(tx) + 0.5f) * float(m_texel.width);
-            float py = (float(ty) + 0.5f) * float(m_texel.height);
-
-            uint32_t eye = l;
-            float lx = px;
-
-            if (sbs)
-            {
-              eye = px < eyeW ? 0u : 1u;
-              lx = px - float(eye) * eyeW;
-            }
-
-            float cxp = fx[eye] * eyeW;
-            float cyp = fy[eye] * float(extent.height);
-            float d = std::hypot(lx - cxp, py - cyp) / std::min(eyeW, float(extent.height));
-
-            uint8_t rate = 0u;
-
-            if (d >= r1)
-              rate = uint8_t(d >= r2 ? coarse : mid);
-
-            data[size_t(l) * layerStride + size_t(ty) * tilesX + tx] = rate;
-          }
-        }
-      }
+      const uint32_t layerStride = (tilesX * tilesY + 3u) & ~3u;
+      const auto &data = m_cpuMap->data;
+      const auto &mapRequest = m_cpuMap->request;
 
       // Previous uses of this slot have completed on the GPU. No broad
       // graphics-to-transfer dependency is needed for a free back slot.
@@ -733,17 +491,18 @@ namespace dxvk
 
       slot->layoutInit = true;
       slot->shape = shape;
-      slot->flags = flags;
-      slot->coarse = coarse;
-      slot->center = centerTiles;
-      slot->dotCenter = center;
+      slot->flags = mapRequest.flags;
+      slot->coarse = mapRequest.coarse;
+      slot->center = mapRequest.center;
+      slot->dotCenter = mapRequest.dotCenter;
       cmd->track(slot);
       cmd->queueSignal(slot->completion, m_buffers.upload(back));
     }
 
     // During startup or a render-target change, use full-rate rendering until
     // a compatible attachment is ready rather than waiting for an upload.
-    if (m_buffers.active < 0 || m_slots[m_buffers.active]->shape != shape || m_slots[m_buffers.active]->coarse != coarse)
+    if (!m_cpuMap || !m_cpuMap->valid || m_buffers.active < 0
+        || m_slots[m_buffers.active]->shape != shape || m_slots[m_buffers.active]->coarse != coarse)
       return false;
 
     auto &front = m_slots[m_buffers.active];
@@ -753,7 +512,7 @@ namespace dxvk
     //  - normal: magenta dots at the displayed attachment's saved gaze,
     //    including its upload latency and tile-granularity update caching.
     //  - FAKE=grid: 8 differently colored squares at known framebuffer positions
-    if ((m_dot || m_fake == 5) && sbs)
+    if ((m_dot || m_grid) && sbs)
     {
       g_gazeDot.passActive = true;
       g_gazeDot.width = int32_t(extent.width);
@@ -778,7 +537,7 @@ namespace dxvk
         d.rgb[2] = cb;
       };
 
-      if (m_fake == 5)
+      if (m_grid)
       {
         const int32_t sz = 70;
         add(0.03f, 0.06f, sz, 1.0f, 0.0f, 0.0f); // top-left corner      red

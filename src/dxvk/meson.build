@@ -51,6 +51,7 @@ dxvk_src = [
   'dxvk_gpu_query.cpp',
   'dxvk_graphics.cpp',
   'dxvk_gaze_vrs.cpp',
+  'dxvk_gaze_source.cpp',
   'dxvk_hang.cpp',
   'dxvk_image.cpp',
   'dxvk_implicit_resolve.cpp',

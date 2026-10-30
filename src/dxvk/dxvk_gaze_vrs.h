@@ -1,13 +1,11 @@
 #pragma once
 
-#include "dxvk_gaze_shm.h"
 #include "dxvk_gaze_buffer.h"
 
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <map>
-#include <string>
 #include <vector>
 
 #include "dxvk_include.h"
@@ -17,6 +15,7 @@ namespace dxvk
 
   class DxvkDevice;
   class DxvkCommandList;
+  struct GazeMap;
 
   bool dxvkGazeVrsEnabled(const DxvkDevice *device);
 
@@ -36,16 +35,6 @@ namespace dxvk
         VkRenderingFragmentShadingRateAttachmentInfoKHR &info);
 
   private:
-    using GazeShm = gaze_bridge::SharedGaze;
-
-    struct Gaze
-    {
-      float cx[2];
-      float cy[2];
-      int32_t flipX[2];
-      int32_t flipY[2];
-    };
-
     static constexpr uint32_t MaxLayers = 2u;
 
     DxvkDevice *m_device = nullptr;
@@ -73,15 +62,13 @@ namespace dxvk
     std::array<Rc<Slot>, 2> m_slots;
     GazeVrsBufferState m_buffers;
     bool m_ok = false;
+    struct Worker;
+    std::unique_ptr<Worker> m_mapWorker;
+    std::unique_ptr<GazeMap> m_cpuMap;
+    bool m_loggedWorkerFailure = false;
 
     VkExtent2D m_texel = {16u, 16u};
     VkExtent2D m_maxTiles = {512u, 512u};
-
-    void *m_file = nullptr;
-    void *m_map = nullptr;
-    const GazeShm *m_shm = nullptr;
-    std::chrono::steady_clock::time_point m_nextOpen = {};
-    gaze_bridge::Freshness m_sourceFreshness;
 
     // Configuration
     float m_r1 = 0.20f;
@@ -93,35 +80,19 @@ namespace dxvk
     uint32_t m_autoCoarseRate = 0u;
     VkSampleCountFlagBits m_autoCoarseSamples = VkSampleCountFlagBits(0);
     uint32_t m_minSize = 700u;
-    bool m_flipY = false; // extra global Y flip
-    bool m_swapEyes = false;
-    int m_forceFlipX[2] = {-1, -1}; // -1 = use source default
-    int m_forceFlipY[2] = {-1, -1};
     bool m_debug = false;
     bool m_dot = false;
+    bool m_grid = false;
     int32_t m_dotRadius = 24;
-    bool m_loggedNoGaze = false;
-    float m_gainY = 1.0f;             // multiplies vertical gaze offset from center
-    float m_winMin[2] = {1.0f, 1.0f}; // cx/cy range seen since last log line
-    float m_winMax[2] = {0.0f, 0.0f};
-    float m_winMinX[2] = {1.0f, 1.0f};
-    float m_winMaxX[2] = {0.0f, 0.0f};
     uint32_t m_onlySamples = 0u; // 0 = any; else only passes with this color sample count
     uint32_t m_onlyFormat = 0u;  // 0 = any; else only passes with this VkFormat value
-    float m_fixedY = 0.25f;      // y used by DXVK_GAZE_FAKE=fixed
-    int m_fake = 0;              // 0 = real gaze, 1 = sweep x, 2 = sweep y, 3 = circle
     uint32_t m_forceW = 0u;
     uint32_t m_forceH = 0u;
-    std::string m_path;
 
     std::map<std::array<uint32_t, 5>, uint32_t> m_shapes; // (w, h, layers, fmt, samples) -> pass count
     std::chrono::steady_clock::time_point m_nextSummary = {};
-    std::chrono::steady_clock::time_point m_nextGazeLog = {};
 
     bool createResources();
-    void openSource();
-    void closeSource();
-    bool readGaze(Gaze &g);
   };
 
 }
