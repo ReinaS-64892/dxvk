@@ -125,7 +125,7 @@ namespace dxvk
     m_ok = createResources();
 
     Logger::info(str::format("GazeVRS: init ", m_ok ? "ok" : "FAILED",
-                             ", texel ", m_texel.width, "x", m_texel.height,
+                             ", double-buffered, texel ", m_texel.width, "x", m_texel.height,
                              ", max tiles ", m_maxTiles.width, "x", m_maxTiles.height,
                              ", r1=", m_r1, " r2=", m_r2, ", full_area=", m_fullArea,
                              ", mid_area=", m_midArea, ", coarse=", coarse,
@@ -135,6 +135,16 @@ namespace dxvk
   DxvkGazeVrs::~DxvkGazeVrs()
   {
     closeSource();
+  }
+
+  DxvkGazeVrs::Slot::~Slot()
+  {
+    auto vk = device->vkd();
+    if (view) vk->vkDestroyImageView(vk->device(), view, nullptr);
+    if (image) vk->vkDestroyImage(vk->device(), image, nullptr);
+    if (buffer) vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+    if (imageMem) vk->vkFreeMemory(vk->device(), imageMem, nullptr);
+    if (bufferMem) vk->vkFreeMemory(vk->device(), bufferMem, nullptr);
   }
 
   bool DxvkGazeVrs::createResources()
@@ -163,64 +173,68 @@ namespace dxvk
       return -1;
     };
 
-    VkImageCreateInfo imageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = VK_FORMAT_R8_UINT;
-    imageInfo.extent = {m_maxTiles.width, m_maxTiles.height, 1u};
-    imageInfo.mipLevels = 1u;
-    imageInfo.arrayLayers = MaxLayers;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    for (auto &slot : m_slots)
+    {
+      slot = new Slot(m_device);
+      VkImageCreateInfo imageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      imageInfo.imageType = VK_IMAGE_TYPE_2D;
+      imageInfo.format = VK_FORMAT_R8_UINT;
+      imageInfo.extent = {m_maxTiles.width, m_maxTiles.height, 1u};
+      imageInfo.mipLevels = 1u;
+      imageInfo.arrayLayers = MaxLayers;
+      imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+      imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+      imageInfo.usage = VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    if (vk->vkCreateImage(vk->device(), &imageInfo, nullptr, &m_image))
-      return false;
+      if (vk->vkCreateImage(vk->device(), &imageInfo, nullptr, &slot->image))
+        return false;
 
-    VkMemoryRequirements req = {};
-    vk->vkGetImageMemoryRequirements(vk->device(), m_image, &req);
+      VkMemoryRequirements req = {};
+      vk->vkGetImageMemoryRequirements(vk->device(), slot->image, &req);
 
-    int32_t type = findType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type < 0)
-      return false;
+      int32_t type = findType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (type < 0)
+        return false;
 
-    VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = req.size;
-    allocInfo.memoryTypeIndex = uint32_t(type);
+      VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+      allocInfo.allocationSize = req.size;
+      allocInfo.memoryTypeIndex = uint32_t(type);
 
-    if (vk->vkAllocateMemory(vk->device(), &allocInfo, nullptr, &m_imageMem) || vk->vkBindImageMemory(vk->device(), m_image, m_imageMem, 0))
-      return false;
+      if (vk->vkAllocateMemory(vk->device(), &allocInfo, nullptr, &slot->imageMem) || vk->vkBindImageMemory(vk->device(), slot->image, slot->imageMem, 0))
+        return false;
 
-    VkImageViewCreateInfo viewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    viewInfo.image = m_image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    viewInfo.format = VK_FORMAT_R8_UINT;
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, MaxLayers};
+      VkImageViewCreateInfo viewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      viewInfo.image = slot->image;
+      viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      viewInfo.format = VK_FORMAT_R8_UINT;
+      viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, MaxLayers};
 
-    if (vk->vkCreateImageView(vk->device(), &viewInfo, nullptr, &m_view))
-      return false;
+      if (vk->vkCreateImageView(vk->device(), &viewInfo, nullptr, &slot->view))
+        return false;
 
-    VkBufferCreateInfo bufferInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    // Each layer starts at a four-byte aligned offset in the upload buffer.
-    const VkDeviceSize layerStride = (VkDeviceSize(m_maxTiles.width) * m_maxTiles.height + 3u) & ~VkDeviceSize(3u);
-    bufferInfo.size = layerStride * MaxLayers;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      VkBufferCreateInfo bufferInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+      // Each layer starts at a four-byte aligned offset in the upload buffer.
+      const VkDeviceSize layerStride = (VkDeviceSize(m_maxTiles.width) * m_maxTiles.height + 3u) & ~VkDeviceSize(3u);
+      bufferInfo.size = layerStride * MaxLayers;
+      bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vk->vkCreateBuffer(vk->device(), &bufferInfo, nullptr, &m_buffer))
-      return false;
+      if (vk->vkCreateBuffer(vk->device(), &bufferInfo, nullptr, &slot->buffer))
+        return false;
 
-    vk->vkGetBufferMemoryRequirements(vk->device(), m_buffer, &req);
-    type = findType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type < 0)
-      return false;
+      vk->vkGetBufferMemoryRequirements(vk->device(), slot->buffer, &req);
+      type = findType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (type < 0)
+        return false;
 
-    allocInfo.allocationSize = req.size;
-    allocInfo.memoryTypeIndex = uint32_t(type);
+      allocInfo.allocationSize = req.size;
+      allocInfo.memoryTypeIndex = uint32_t(type);
 
-    if (vk->vkAllocateMemory(vk->device(), &allocInfo, nullptr, &m_bufferMem) || vk->vkBindBufferMemory(vk->device(), m_buffer, m_bufferMem, 0))
-      return false;
+      if (vk->vkAllocateMemory(vk->device(), &allocInfo, nullptr, &slot->bufferMem) || vk->vkBindBufferMemory(vk->device(), slot->buffer, slot->bufferMem, 0))
+        return false;
+    }
 
     return true;
   }
@@ -551,7 +565,35 @@ namespace dxvk
         center[0] / int32_t(m_texel.width), center[1] / int32_t(m_texel.height),
         center[2] / int32_t(m_texel.width), center[3] / int32_t(m_texel.height)};
 
-    const bool upload = !m_layoutInit || tilesX != m_lastTilesX || tilesY != m_lastTilesY || flags != m_lastFlags || centerTiles != m_lastCenter;
+    const std::array<uint32_t, 5> shape = {
+        extent.width, extent.height, usedLayers, uint32_t(colorFormat), uint32_t(samples)};
+
+    // Publish only a completed upload. This barrier precedes any new upload,
+    // so rendering with the front image never depends on the back upload.
+    const std::array<uint64_t, 2> completed = {
+        m_slots[0]->completion->value(), m_slots[1]->completion->value()};
+    if (m_buffers.promote(completed))
+    {
+      VkImageMemoryBarrier2 ready = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+      ready.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      ready.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      ready.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+      ready.dstAccessMask = VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+      ready.oldLayout = ready.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      ready.srcQueueFamilyIndex = ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      ready.image = m_slots[m_buffers.active]->image;
+      ready.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, MaxLayers};
+      VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      dep.imageMemoryBarrierCount = 1u;
+      dep.pImageMemoryBarriers = &ready;
+      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dep);
+    }
+
+    const bool changed = m_buffers.active < 0 || m_slots[m_buffers.active]->shape != shape
+        || m_slots[m_buffers.active]->flags != flags || m_slots[m_buffers.active]->coarse != coarse
+        || m_slots[m_buffers.active]->center != centerTiles;
+    const int32_t back = m_buffers.writable(completed);
+    const bool upload = changed && back >= 0;
 
     if (m_debug && now >= m_nextGazeLog)
     {
@@ -572,57 +614,11 @@ namespace dxvk
       }
     }
 
-    // Debug overlay (sbs only): colored squares drawn at the end of the pass.
-    //  - normal: two magenta dots where we place the fovea
-    //  - FAKE=grid: 8 differently colored squares at known framebuffer positions
-    if ((m_dot || m_fake == 5) && sbs)
-    {
-      g_gazeDot.passActive = true;
-      g_gazeDot.width = int32_t(extent.width);
-      g_gazeDot.height = int32_t(extent.height);
-      g_gazeDot.radius = m_dotRadius;
-      g_gazeDot.x[0] = center[0];
-      g_gazeDot.y[0] = center[1];
-      g_gazeDot.x[1] = int32_t(eyeW) + center[2];
-      g_gazeDot.y[1] = center[3];
-      g_gazeDot.count = 0;
-
-      auto add = [&](float px, float py, int32_t r, float cr, float cg, float cb)
-      {
-        if (g_gazeDot.count >= 16u)
-          return;
-        auto &d = g_gazeDot.dots[g_gazeDot.count++];
-        d.x = int32_t(px * float(extent.width));
-        d.y = int32_t(py * float(extent.height));
-        d.r = r;
-        d.rgb[0] = cr;
-        d.rgb[1] = cg;
-        d.rgb[2] = cb;
-      };
-
-      if (m_fake == 5)
-      {
-        const int32_t sz = 70;
-        add(0.03f, 0.06f, sz, 1.0f, 0.0f, 0.0f); // top-left corner      red
-        add(0.97f, 0.06f, sz, 0.0f, 1.0f, 0.0f); // top-right corner     green
-        add(0.03f, 0.94f, sz, 0.0f, 0.0f, 1.0f); // bottom-left corner   blue
-        add(0.97f, 0.94f, sz, 1.0f, 1.0f, 0.0f); // bottom-right corner  yellow
-        add(0.25f, 0.50f, sz, 1.0f, 1.0f, 1.0f); // center of left half  white
-        add(0.75f, 0.50f, sz, 1.0f, 0.0f, 1.0f); // center of right half magenta
-        add(0.25f, 0.12f, sz, 0.0f, 1.0f, 1.0f); // top of left half     cyan
-        add(0.75f, 0.12f, sz, 1.0f, 0.5f, 0.0f); // top of right half    orange
-      }
-      else
-      {
-        add(float(g_gazeDot.x[0]) / float(extent.width), float(g_gazeDot.y[0]) / float(extent.height), m_dotRadius, 1.0f, 0.0f, 1.0f);
-        add(float(g_gazeDot.x[1]) / float(extent.width), float(g_gazeDot.y[1]) / float(extent.height), m_dotRadius, 1.0f, 0.0f, 1.0f);
-      }
-    }
-
     VkImageSubresourceRange allLayers = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, MaxLayers};
 
     if (upload)
     {
+      auto &slot = m_slots[back];
       const uint32_t tileCount = tilesX * tilesY;
       const uint32_t layerStride = (tileCount + 3u) & ~3u;
       std::vector<uint8_t> data(size_t(layerStride) * usedLayers, 0u);
@@ -676,32 +672,20 @@ namespace dxvk
         }
       }
 
+      // Previous uses of this slot have completed on the GPU. No broad
+      // graphics-to-transfer dependency is needed for a free back slot.
       VkImageMemoryBarrier2 imgBarrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-      imgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-      imgBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+      imgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
       imgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
       imgBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-      imgBarrier.oldLayout = m_layoutInit ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+      imgBarrier.oldLayout = slot->layoutInit ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
       imgBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
       imgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       imgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      imgBarrier.image = m_image;
+      imgBarrier.image = slot->image;
       imgBarrier.subresourceRange = allLayers;
 
-      VkBufferMemoryBarrier2 bufBarrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
-      bufBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-      bufBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-      bufBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-      bufBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-      bufBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      bufBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      bufBarrier.buffer = m_buffer;
-      bufBarrier.offset = 0u;
-      bufBarrier.size = VK_WHOLE_SIZE;
-
       VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-      dep.bufferMemoryBarrierCount = 1u;
-      dep.pBufferMemoryBarriers = &bufBarrier;
       dep.imageMemoryBarrierCount = 1u;
       dep.pImageMemoryBarriers = &imgBarrier;
       cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dep);
@@ -709,10 +693,13 @@ namespace dxvk
       for (size_t off = 0u; off < data.size(); off += 65536u)
       {
         size_t chunk = std::min<size_t>(65536u, data.size() - off);
-        cmd->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, m_buffer, off, chunk, data.data() + off);
+        cmd->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, slot->buffer, off, chunk, data.data() + off);
       }
 
-      VkBufferMemoryBarrier2 bufBarrier2 = bufBarrier;
+      VkBufferMemoryBarrier2 bufBarrier2 = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+      bufBarrier2.srcQueueFamilyIndex = bufBarrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      bufBarrier2.buffer = slot->buffer;
+      bufBarrier2.size = VK_WHOLE_SIZE;
       bufBarrier2.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
       bufBarrier2.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
       bufBarrier2.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
@@ -737,38 +724,80 @@ namespace dxvk
       }
 
       VkCopyBufferToImageInfo2 copyInfo = {VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2};
-      copyInfo.srcBuffer = m_buffer;
-      copyInfo.dstImage = m_image;
+      copyInfo.srcBuffer = slot->buffer;
+      copyInfo.dstImage = slot->image;
       copyInfo.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL;
       copyInfo.regionCount = usedLayers;
       copyInfo.pRegions = regions.data();
       cmd->cmdCopyBufferToImage(DxvkCmdBuffer::ExecBuffer, &copyInfo);
 
-      m_layoutInit = true;
-      m_lastTilesX = tilesX;
-      m_lastTilesY = tilesY;
-      m_lastFlags = flags;
-      m_lastCenter = centerTiles;
+      slot->layoutInit = true;
+      slot->shape = shape;
+      slot->flags = flags;
+      slot->coarse = coarse;
+      slot->center = centerTiles;
+      slot->dotCenter = center;
+      cmd->track(slot);
+      cmd->queueSignal(slot->completion, m_buffers.upload(back));
     }
 
-    VkImageMemoryBarrier2 useBarrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    useBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    useBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    useBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
-    useBarrier.dstAccessMask = VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
-    useBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    useBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    useBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    useBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    useBarrier.image = m_image;
-    useBarrier.subresourceRange = allLayers;
+    // During startup or a render-target change, use full-rate rendering until
+    // a compatible attachment is ready rather than waiting for an upload.
+    if (m_buffers.active < 0 || m_slots[m_buffers.active]->shape != shape || m_slots[m_buffers.active]->coarse != coarse)
+      return false;
 
-    VkDependencyInfo useDep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    useDep.imageMemoryBarrierCount = 1u;
-    useDep.pImageMemoryBarriers = &useBarrier;
-    cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &useDep);
+    auto &front = m_slots[m_buffers.active];
+    cmd->track(front);
+    cmd->queueSignal(front->completion, m_buffers.read());
+    // Debug overlay (sbs only): colored squares drawn at the end of the pass.
+    //  - normal: magenta dots at the displayed attachment's saved gaze,
+    //    including its upload latency and tile-granularity update caching.
+    //  - FAKE=grid: 8 differently colored squares at known framebuffer positions
+    if ((m_dot || m_fake == 5) && sbs)
+    {
+      g_gazeDot.passActive = true;
+      g_gazeDot.width = int32_t(extent.width);
+      g_gazeDot.height = int32_t(extent.height);
+      g_gazeDot.radius = m_dotRadius;
+      g_gazeDot.x[0] = front->dotCenter[0];
+      g_gazeDot.y[0] = front->dotCenter[1];
+      g_gazeDot.x[1] = int32_t(eyeW) + front->dotCenter[2];
+      g_gazeDot.y[1] = front->dotCenter[3];
+      g_gazeDot.count = 0;
 
-    info.imageView = m_view;
+      auto add = [&](float px, float py, int32_t r, float cr, float cg, float cb)
+      {
+        if (g_gazeDot.count >= 16u)
+          return;
+        auto &d = g_gazeDot.dots[g_gazeDot.count++];
+        d.x = int32_t(px * float(extent.width));
+        d.y = int32_t(py * float(extent.height));
+        d.r = r;
+        d.rgb[0] = cr;
+        d.rgb[1] = cg;
+        d.rgb[2] = cb;
+      };
+
+      if (m_fake == 5)
+      {
+        const int32_t sz = 70;
+        add(0.03f, 0.06f, sz, 1.0f, 0.0f, 0.0f); // top-left corner      red
+        add(0.97f, 0.06f, sz, 0.0f, 1.0f, 0.0f); // top-right corner     green
+        add(0.03f, 0.94f, sz, 0.0f, 0.0f, 1.0f); // bottom-left corner   blue
+        add(0.97f, 0.94f, sz, 1.0f, 1.0f, 0.0f); // bottom-right corner  yellow
+        add(0.25f, 0.50f, sz, 1.0f, 1.0f, 1.0f); // center of left half  white
+        add(0.75f, 0.50f, sz, 1.0f, 0.0f, 1.0f); // center of right half magenta
+        add(0.25f, 0.12f, sz, 0.0f, 1.0f, 1.0f); // top of left half     cyan
+        add(0.75f, 0.12f, sz, 1.0f, 0.5f, 0.0f); // top of right half    orange
+      }
+      else
+      {
+        add(float(g_gazeDot.x[0]) / float(extent.width), float(g_gazeDot.y[0]) / float(extent.height), m_dotRadius, 1.0f, 0.0f, 1.0f);
+        add(float(g_gazeDot.x[1]) / float(extent.width), float(g_gazeDot.y[1]) / float(extent.height), m_dotRadius, 1.0f, 0.0f, 1.0f);
+      }
+    }
+
+    info.imageView = front->view;
     info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     info.shadingRateAttachmentTexelSize = m_texel;
     return true;

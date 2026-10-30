@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dxvk_gaze_shm.h"
+#include "dxvk_gaze_buffer.h"
 
 #include <array>
 #include <chrono>
@@ -49,13 +50,29 @@ namespace dxvk
 
     DxvkDevice *m_device = nullptr;
 
-    VkImage m_image = VK_NULL_HANDLE;
-    VkImageView m_view = VK_NULL_HANDLE;
-    VkDeviceMemory m_imageMem = VK_NULL_HANDLE;
-    VkBuffer m_buffer = VK_NULL_HANDLE;
-    VkDeviceMemory m_bufferMem = VK_NULL_HANDLE;
+    // Each slot owns both the attachment and its upload buffer. Completion is
+    // polled; an in-flight slot is never overwritten or waited on.
+    struct Slot : public RcObject
+    {
+      explicit Slot(DxvkDevice *device) : device(device) { }
+      ~Slot();
+      DxvkDevice *device;
+      VkImage image = VK_NULL_HANDLE;
+      VkImageView view = VK_NULL_HANDLE;
+      VkDeviceMemory imageMem = VK_NULL_HANDLE;
+      VkBuffer buffer = VK_NULL_HANDLE;
+      VkDeviceMemory bufferMem = VK_NULL_HANDLE;
+      Rc<sync::Fence> completion = new sync::Fence();
+      bool layoutInit = false;
+      std::array<uint32_t, 5> shape = {};
+      uint32_t flags = ~0u;
+      uint32_t coarse = ~0u;
+      std::array<int32_t, 4> center = {-1, -1, -1, -1};
+      std::array<int32_t, 4> dotCenter = {};
+    };
+    std::array<Rc<Slot>, 2> m_slots;
+    GazeVrsBufferState m_buffers;
     bool m_ok = false;
-    bool m_layoutInit = false;
 
     VkExtent2D m_texel = {16u, 16u};
     VkExtent2D m_maxTiles = {512u, 512u};
@@ -66,11 +83,6 @@ namespace dxvk
     std::chrono::steady_clock::time_point m_nextOpen = {};
     gaze_bridge::Freshness m_sourceFreshness;
 
-    uint32_t m_lastTilesX = 0u;
-    uint32_t m_lastTilesY = 0u;
-    uint32_t m_lastFlags = ~0u;
-    std::array<int32_t, 4> m_lastCenter = {-1, -1, -1, -1};
-
     // Configuration
     float m_r1 = 0.20f;
     float m_r2 = 0.40f;
@@ -80,7 +92,6 @@ namespace dxvk
     bool m_autoCoarse = false;
     uint32_t m_autoCoarseRate = 0u;
     VkSampleCountFlagBits m_autoCoarseSamples = VkSampleCountFlagBits(0);
-    uint32_t m_lastCoarse = ~0u;
     uint32_t m_minSize = 700u;
     bool m_flipY = false; // extra global Y flip
     bool m_swapEyes = false;
