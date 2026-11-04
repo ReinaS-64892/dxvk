@@ -122,6 +122,10 @@ namespace dxvk {
 
     ~DxvkIrShader();
 
+    Rc<DxvkShader> createQvfrVirtualShader();
+
+    Rc<DxvkShader> createQvfrOrientationProbe(uint32_t slot, uint16_t& samplerMask);
+
     /**
      * \brief Queries shader create info
      * \returns Shader create info
@@ -182,6 +186,8 @@ namespace dxvk {
   private:
 
     Rc<DxvkIrShaderConverter>     m_baseIr;
+    Rc<DxvkIrShaderConverter>     m_qvfrConverter;
+    Rc<DxvkIrShaderConverter>     m_qvfrProbeConverter;
     std::string                   m_debugName;
 
     DxvkIrShaderCreateInfo        m_info;

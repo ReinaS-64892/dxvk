@@ -68,6 +68,11 @@ dxvk_src = [
   'dxvk_platform_exts.cpp',
   'dxvk_presenter.cpp',
   'dxvk_queue.cpp',
+  'dxvk_qvfr.cpp',
+  'dxvk_qvfr_post.cpp',
+  'dxvk_qvfr_probe.cpp',
+  'dxvk_qvfr_render.cpp',
+  'dxvk_qvfr_virtual.cpp',
   'dxvk_sampler.cpp',
   'dxvk_shader.cpp',
   'dxvk_shader_builtin.cpp',
@@ -105,7 +110,7 @@ endif
 dxvk_lib = static_library('dxvk', dxvk_src, glsl_generator.process(dxvk_shaders), dxvk_version,
   link_with           : [ util_lib, spirv_lib, wsi_lib ],
   dependencies        : [ dxbc_spirv_dep, vkcommon_dep ] + dxvk_extra_deps,
-  include_directories : [ dxvk_include_path ],
+  include_directories : [ dxvk_include_path, include_directories('../..') ],
 )
 
 dxvk_dep = declare_dependency(

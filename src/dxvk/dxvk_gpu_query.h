@@ -369,6 +369,13 @@ namespace dxvk {
     
     ~DxvkGpuQueryManager();
 
+    bool hasEnabledQueries() const {
+      for (const auto& set : m_activeQueries)
+        if (!set.queries.empty())
+          return true;
+      return false;
+    }
+
     /**
      * \brief Enables a query
      * 

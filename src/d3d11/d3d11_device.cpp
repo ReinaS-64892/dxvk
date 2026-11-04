@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstring>
+#include "../util/util_env.h"
 
 #include <dxbc/dxbc_container.h>
 #include <dxbc/dxbc_parser.h>
@@ -2760,6 +2761,12 @@ namespace dxvk {
     const Rc<DxvkDevice>&             Device,
     const D3D11Options&               Options) {
     auto result = Device->getShaderCompileOptions();
+
+    if (env::getEnvVar("DXVK_QVFR") == "1") {
+      result.flags.set(DxvkShaderCompileFlag::QvfrVirtualCandidate);
+      if (env::getEnvVar("DXVK_QVFR_UNSAFE") == "1" && env::getEnvVar("DXVK_QVFR_DEBUG") != "1")
+        result.flags.set(DxvkShaderCompileFlag::QvfrUnsafeVirtual);
+    }
 
     if (Options.disableMsaa)
       result.flags.set(DxvkShaderCompileFlag::DisableMsaa);

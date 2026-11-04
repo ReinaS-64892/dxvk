@@ -225,6 +225,11 @@ conf_data = configuration_data()
 conf_data.set('BUILD_COMPILER', cpp.get_id())
 conf_data.set('BUILD_COMPILER_VERSION', cpp.version())
 conf_data.set('BUILD_TARGET', cpu_family)
+qvfr_control_path = meson.project_source_root() / '..' / 'qvfr-control.txt'
+if platform == 'windows' and build_machine.system() != 'windows'
+  qvfr_control_path = 'Z:' + qvfr_control_path
+endif
+conf_data.set_quoted('QVFR_CONTROL_FILE', qvfr_control_path)
 dxvk_buildenv = configure_file(
   configuration : conf_data,
   input:  'buildenv.h.in',

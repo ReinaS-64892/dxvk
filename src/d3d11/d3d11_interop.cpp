@@ -88,6 +88,7 @@ namespace dxvk {
     auto immediateContext = m_device->GetContext();
     auto immediateContextLock = immediateContext->LockContext();
 
+    immediateContext->FinalizeQvfrForExternalUse();
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
   }
   

@@ -361,6 +361,8 @@ namespace dxvk {
 
     for (auto& xfb : metadata.xfbStrides)
       status = status && read(stream, offset, xfb);
+    if (metadata.flags.test(DxvkShaderFlag::QvfrVirtualSampling))
+      for (auto& mask : metadata.qvfrSamplers) status = status && read(stream, offset, mask);
 
     return status;
   }
@@ -579,6 +581,8 @@ namespace dxvk {
 
     for (const auto& xfb : metadata.xfbStrides)
       status = status && write(stream, xfb);
+    if (metadata.flags.test(DxvkShaderFlag::QvfrVirtualSampling))
+      for (auto mask : metadata.qvfrSamplers) status = status && write(stream, mask);
 
     return status;
   }

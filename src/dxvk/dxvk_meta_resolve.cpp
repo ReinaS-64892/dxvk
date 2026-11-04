@@ -193,6 +193,12 @@ namespace dxvk {
 
     if (shaderStage) {
       viewInfo.aspects &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+      // Stencil-only shaders use the second descriptor, but the first view
+      // must still be valid even though the shader does not reference it.
+      if (!viewInfo.aspects) {
+        viewInfo.aspects = lookupFormatInfo(srcFormat)->aspectMask & ~VK_IMAGE_ASPECT_STENCIL_BIT;
+        if (!viewInfo.aspects) viewInfo.aspects = VK_IMAGE_ASPECT_STENCIL_BIT;
+      }
       viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
     }
 

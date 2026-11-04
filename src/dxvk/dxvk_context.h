@@ -14,6 +14,10 @@
 
 namespace dxvk {
 
+  struct DxvkQvfrState;
+  namespace qvfr { struct ControlSettings; }
+  namespace qvfr { struct Rect; }
+
   /**
    * \brief DXVK context
    * 
@@ -118,9 +122,13 @@ namespace dxvk {
      *
      * Invalidates all state and provides the caller
      * with the objects necessary to start drawing.
+     * Optional images declare the complete color-image dependency set of a
+     * presentation blit. Omit both for arbitrary external rendering.
      * \returns Current command list object
      */
-    Rc<DxvkCommandList> beginExternalRendering();
+    Rc<DxvkCommandList> beginExternalRendering(
+      const DxvkImage* readImage = nullptr,
+      const DxvkImage* writeImage = nullptr);
 
     /**
      * \brief Begins generating query data
@@ -1331,7 +1339,71 @@ namespace dxvk {
      */
     void setDebugName(const Rc<DxvkPagedResource>& resource, const char* name);
 
+    // Called in CS order before giving an external consumer the submission queue.
+    void finalizeQvfrForExternalUse();
+
   private:
+    std::unique_ptr<DxvkQvfrState> m_qvfr;
+    bool m_qvfrBusy = false;
+    void initQvfr();
+    void pollQvfrControl();
+    void applyQvfrControl(const qvfr::ControlSettings& settings, bool initial);
+    void drawQvfrSourceOutline(size_t index);
+    bool beginQvfrDraw();
+    void finishQvfrScene(const char* reason);
+    bool beginQvfrPostDraw();
+    void nextQvfrPostDraw(uint32_t pass);
+    void endQvfrPostDraw();
+    bool composeQvfrColor(size_t index);
+    void focusQvfrDraw();
+    void copyQvfrStencil(const Rc<DxvkImageView>& dst, qvfr::Rect dstRect,
+      const Rc<DxvkImageView>& src, qvfr::Rect srcRect);
+    void endQvfrDraw();
+    void flushQvfr(const char* reason = "explicit",
+      VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    void flushQvfrGroup(size_t index, const char* reason,
+      VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    void flushQvfrImage(const DxvkImage* image, const char* reason,
+      VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    void flushQvfrView(const DxvkImageView* view, const char* reason);
+    void flushQvfrShaderImages(bool compute);
+    void flushQvfrDrawTargets(const char* reason = "other");
+    void flushQvfrSharedImages();
+    void noteQvfrExternalImage(const DxvkImage& image, VkImageLayout layout);
+    bool skipQvfr(const char* reason);
+    void reportQvfr();
+    size_t beginQvfrTiming(const char* phase);
+    void endQvfrTiming(size_t index);
+    void pollQvfrTimings();
+    bool beginQvfrOrientationProbe();
+    void nextQvfrOrientationProbe(uint32_t point);
+    void endQvfrOrientationProbe();
+    void pollQvfrOrientationProbes();
+    void traceQvfrOrientationTransfer(const char* kind, const DxvkImage& src, const DxvkImage& dst,
+      const VkImageSubresourceLayers& srcSub, VkOffset3D src0, VkOffset3D src1,
+      const VkImageSubresourceLayers& dstSub, VkOffset3D dst0, VkOffset3D dst1);
+    bool tryQvfrVirtualCopy(const Rc<DxvkImage>& dst, const Rc<DxvkImage>& src,
+      const VkImageSubresourceLayers& dstSub, VkOffset3D dstOffset,
+      const VkImageSubresourceLayers& srcSub, VkOffset3D srcOffset,
+      VkExtent3D extent, bool resolve, VkFormat format = VK_FORMAT_UNDEFINED);
+    void materializeQvfrVirtual(const DxvkImage* image, const char* reason);
+    void prepareQvfrFullClear(const DxvkImageView* view, VkImageAspectFlags aspects);
+    void prepareQvfrVirtualReads();
+    void restoreQvfrVirtualReads();
+    bool deferQvfrPublish(const char* reason);
+    bool beginQvfrTerminalDraw();
+    void noteQvfrTerminalWrite(const DxvkImage& image, const char* operation);
+    bool dropUnsafeQvfrDraw();
+    bool dropUnsafeQvfrCompute();
+    uint32_t qvfrReplayEyes() const;
+
+    // Diagnostic only: records executed backend draws without changing state.
+    void initQvfrTrace();
+    void traceQvfrDraw(const char* kind, uint32_t count,
+      int64_t instances, uint32_t firstInstance);
+
+    bool m_qvfrTraceEnabled = false;
+    uint64_t m_qvfrPass = 0;
     
     Rc<DxvkDevice>          m_device;
     DxvkObjects*            m_common;
@@ -1504,7 +1576,8 @@ namespace dxvk {
       const Rc<DxvkImage>&        srcImage,
             VkImageSubresourceLayers srcSubresource,
             VkOffset3D            srcOffset,
-            VkExtent3D            extent);
+            VkExtent3D            extent,
+            VkExtent3D            sourceExtent = { });
 
     bool copyImageClear(
       const Rc<DxvkImage>&        dstImage,

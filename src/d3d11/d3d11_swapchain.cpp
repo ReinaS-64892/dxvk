@@ -521,7 +521,8 @@ namespace dxvk {
 
       // Blit the D3D back buffer onto the actual Vulkan
       // swap chain and render the HUD if we have one.
-      auto contextObjects = ctx->beginExternalRendering();
+      auto contextObjects = ctx->beginExternalRendering(
+        cSwapImage->image(), cBackBuffer->image());
 
       cBlitter->present(contextObjects, cHud, cClearColor,
         cBackBuffer, cDstRect, cSwapImage, cSrcRect);

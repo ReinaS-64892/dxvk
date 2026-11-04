@@ -520,13 +520,14 @@ namespace dxvk {
     const Rc<DxvkIrShaderConverter>&      converter) {
     Rc<DxvkIrShader> shader = nullptr;
 
-    if (m_shaderCache && !converter)
+    bool qvfrCandidate = createInfo.options.flags.test(DxvkShaderCompileFlag::QvfrVirtualCandidate);
+    if (m_shaderCache && !converter && !qvfrCandidate)
       shader = m_shaderCache->lookupShader(name, createInfo);
 
     if (!shader && converter) {
       shader = new DxvkIrShader(createInfo, converter);
 
-      if (m_shaderCache)
+      if (m_shaderCache && !qvfrCandidate)
         m_shaderCache->addShader(shader);
     }
 

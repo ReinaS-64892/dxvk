@@ -1,4 +1,5 @@
 #include <utility>
+#include "buildenv.h"
 
 #include "log.h"
 
@@ -123,6 +124,12 @@ namespace dxvk {
   
   std::string Logger::getFileName(const std::string& base) {
     std::string path = env::getEnvVar("DXVK_LOG_PATH");
+    if (path.empty() && env::getEnvVar("DXVK_QVFR") == "1") {
+      auto control = env::getEnvVar("DXVK_QVFR_CONTROL_FILE");
+      if (control.empty()) control = QVFR_CONTROL_FILE;
+      auto parent = control.find_last_of("/\\");
+      if (parent != std::string::npos) path = control.substr(0, parent) + "/logs";
+    }
     
     if (path == "none")
       return std::string();

@@ -3183,6 +3183,14 @@ namespace dxvk {
 
 
   template<typename ContextType>
+  void D3D11CommonContext<ContextType>::FinalizeQvfrForExternalUse() {
+    EmitCs([] (DxvkContext* ctx) {
+      ctx->finalizeQvfrForExternalUse();
+    });
+  }
+
+
+  template<typename ContextType>
   DxvkCsChunkRef D3D11CommonContext<ContextType>::AllocCsChunk() {
     return m_parent->AllocCsChunk(m_csFlags);
   }

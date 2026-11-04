@@ -63,6 +63,9 @@ namespace dxvk {
     SemanticIo                  = 12u,
     /// Whether to explicitly use BDA for fully-bound constant buffers.
     LowerInBoundsCbvToBda       = 13u,
+    QvfrVirtualSamples          = 14u,
+    QvfrVirtualCandidate        = 15u,
+    QvfrUnsafeVirtual           = 16u,
   };
 
   using DxvkShaderCompileFlags = Flags<DxvkShaderCompileFlag>;
@@ -166,6 +169,7 @@ namespace dxvk {
     UsesSparseResidency,
     TessellationPoints,
     SemanticIo,
+    QvfrVirtualSampling,
   };
 
   using DxvkShaderFlags = Flags<DxvkShaderFlag>;
@@ -180,6 +184,7 @@ namespace dxvk {
     DxvkShaderFlags flags = { };
     /// Specialization constant IDs used by the shader
     uint32_t specConstantMask = 0u;
+    std::array<uint16_t, 128> qvfrSamplers = { };
     /// Input variables consumed by the shader
     DxvkShaderIo inputs = { };
     /// Output variables produced by the shader

@@ -1,6 +1,7 @@
 #include "dxvk_shader_builtin.h"
 #include "dxvk_device.h"
 #include "dxvk_meta_blit.h"
+#include "dxvk_qvfr_composite_ir.h"
 #include "dxvk_util.h"
 
 namespace dxvk {
@@ -114,7 +115,7 @@ namespace dxvk {
     // The resolve shader expects raw pixel coordinates, the regular sampling
     // path requires normalized coordinates. Divide by the image size in that
     // case in order to keep the shader interface consistent.
-    if (!ir::resourceIsMultisampled(srcKind)) {
+    if (!ir::resourceIsMultisampled(srcKind) && !key.qvfrComposite) {
       ir::Type infoType = ir::Type()
         .addStructMember(coordTypeU)
         .addStructMember(ir::ScalarType::eU32);
@@ -127,6 +128,29 @@ namespace dxvk {
     }
 
     helper.exportOutput(builder, 0u, coord, "coord");
+    return helper.buildShader(builder);
+  }
+
+
+  std::vector<uint32_t> DxvkMetaBlitObjects::createPsQvfr(
+      const DxvkMetaBlit::Key& key, const DxvkPipelineLayout* layout) {
+    ir::Builder builder;
+    DxvkBuiltInShader helper(m_device, layout, getName(key, "ps"));
+    auto pixel = helper.buildPixelShader(builder);
+    auto image = helper.declareImageSrv(builder, 0u, "atlas", VK_IMAGE_VIEW_TYPE_2D,
+      key.dstFormat, VK_IMAGE_ASPECT_COLOR_BIT, key.srcSamples);
+    ir::BasicType f2(ir::ScalarType::eF32, 2), i2(ir::ScalarType::eI32, 2);
+    auto coord = helper.declareInput(builder, f2, 0u, "coord", ir::InterpolationMode::eSample);
+    auto position = helper.declareBuiltInInput(builder, ir::BasicType(ir::ScalarType::eF32, 4), ir::BuiltIn::ePosition);
+    position = helper.emitExtractVector(builder, position, 0u, 2u);
+    auto dst = helper.declarePushData(builder, i2, offsetof(DxvkMetaBlit::Args, focusDst), "focusDst");
+    auto src = helper.declarePushData(builder, i2, offsetof(DxvkMetaBlit::Args, focusSrc), "focusSrc");
+    auto extent = helper.declarePushData(builder, i2, offsetof(DxvkMetaBlit::Args, focusExtent), "focusExtent");
+    auto fade = helper.declarePushData(builder, ir::ScalarType::eF32, offsetof(DxvkMetaBlit::Args, focusFade), "focusFade");
+    auto sourceExtent = helper.declarePushData(builder, i2, offsetof(DxvkMetaBlit::Args, focusSourceExtent), "focusSourceExtent");
+    auto value = qvfr::emitCompositeColor(builder, image, coord, position, dst, src, extent,
+      sourceExtent, fade, pixel.sampleId, uint32_t(key.srcSamples));
+    helper.exportOutput(builder, 0u, value, "color");
     return helper.buildShader(builder);
   }
 
@@ -428,7 +452,8 @@ namespace dxvk {
       formatInfo->aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT));
 
     auto vsSpirv = createVs(key, aspect, result.layout);
-    auto psSpirv = (key.srcSamples == VK_SAMPLE_COUNT_1_BIT)
+    auto psSpirv = key.qvfrComposite ? createPsQvfr(key, result.layout)
+      : (key.srcSamples == VK_SAMPLE_COUNT_1_BIT)
       ? createPsSimple(key, aspect, result.layout)
       : (key.resolveMode == DxvkMetaBlitResolveMode::ResolveAverage
         ? createPsResolve(key, aspect, result.layout)
@@ -441,6 +466,15 @@ namespace dxvk {
     state.colorFormats[0] = aspect == VK_IMAGE_ASPECT_COLOR_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
     state.depthFormat = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
 
+    // Blits write depth only. A combined depth/stencil destination still
+    // declares its stencil format, but must preserve stencil contents.
+    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+      state.dsState = &ds;
+
     result.pipeline = m_device->createBuiltInGraphicsPipeline(result.layout, state);
     return result;
   }
@@ -448,7 +482,7 @@ namespace dxvk {
 
   std::string DxvkMetaBlitObjects::getName(const DxvkMetaBlit::Key& key, const char* type) {
     std::stringstream name;
-    name << "meta_" << type << "_blit";
+    name << "meta_" << type << (key.qvfrComposite ? "_qvfr_composite" : "_blit");
     name << "_" << str::format(key.srcViewType).substr(std::strlen("VK_IMAGE_VIEW_TYPE_"));
     name << "_" << str::format(key.dstFormat).substr(std::strlen("VK_FORMAT_"));
 

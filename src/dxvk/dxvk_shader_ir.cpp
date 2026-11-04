@@ -5,6 +5,9 @@
 #include <util/util_log.h>
 
 #include "dxvk_shader_ir.h"
+#include "dxvk_qvfr_ir.h"
+#include "dxvk_qvfr_probe_ir.h"
+#include "../util/util_env.h"
 
 namespace dxvk {
 
@@ -1983,7 +1986,12 @@ namespace dxvk {
     const DxvkIrShaderCreateInfo&   info,
           Rc<DxvkIrShaderConverter> shader)
   : m_baseIr(std::move(shader)), m_debugName(m_baseIr->getDebugName()), m_info(info) {
-
+    if (info.options.flags.test(DxvkShaderCompileFlag::QvfrVirtualCandidate))
+      m_qvfrConverter = m_baseIr;
+    // Keep the original IR so runtime control can enable UV diagnostics after
+    // this shader was created. No diagnostic shader is compiled until used.
+    if (env::getEnvVar("DXVK_QVFR") == "1")
+      m_qvfrProbeConverter = m_baseIr;
   }
 
 
@@ -2004,6 +2012,52 @@ namespace dxvk {
 
   DxvkIrShader::~DxvkIrShader() {
 
+  }
+
+  Rc<DxvkShader> DxvkIrShader::createQvfrVirtualShader() {
+    if (!m_qvfrConverter) return nullptr;
+    auto info = m_info;
+    info.options.flags.clr(DxvkShaderCompileFlag::QvfrVirtualCandidate);
+    info.options.flags.set(DxvkShaderCompileFlag::QvfrVirtualSamples);
+    return new DxvkIrShader(info, m_qvfrConverter);
+  }
+
+  Rc<DxvkShader> DxvkIrShader::createQvfrOrientationProbe(uint32_t slot, uint16_t& samplerMask) {
+    if (!m_qvfrProbeConverter) return nullptr;
+    // Validate before creating a pipeline, and retain the transformed original
+    // IR. This also works for shaders ineligible for virtual sampling.
+    class ProbeConverter final : public DxvkIrShaderConverter {
+    public:
+      ProbeConverter(Rc<DxvkIrShaderConverter> base, std::vector<uint8_t> ir, uint32_t slot)
+      : m_base(std::move(base)), m_ir(std::move(ir)), m_slot(slot) { }
+      void convertShader(dxbc_spv::ir::Builder& b) override {
+        dxbc_spv::ir::Deserializer parser(m_ir.data(), m_ir.size());
+        if (!parser.deserialize(b))
+          throw DxvkError("QVFR orientation probe: invalid IR");
+      }
+      uint32_t determineResourceIndex(dxbc_spv::ir::ShaderStage stage,
+          dxbc_spv::ir::ScalarType type, uint32_t space, uint32_t index) const override {
+        return m_base->determineResourceIndex(stage, type, space, index);
+      }
+      void dumpSource(const std::string&) const override { }
+      std::string getDebugName() const override {
+        return m_base->getDebugName() + "-qvfr-uv-" + std::to_string(m_slot);
+      }
+    private:
+      Rc<DxvkIrShaderConverter> m_base;
+      std::vector<uint8_t> m_ir;
+      uint32_t m_slot;
+    };
+    dxbc_spv::ir::Builder b;
+    m_qvfrProbeConverter->convertShader(b);
+    if (!qvfr::lowerOrientationProbe(b, slot, &samplerMask)) return nullptr;
+    dxbc_spv::ir::Serializer serializer(b);
+    std::vector<uint8_t> ir(serializer.computeSerializedSize());
+    serializer.serialize(ir.data(), ir.size());
+    auto info = m_info;
+    info.options.flags.clr(DxvkShaderCompileFlag::QvfrVirtualCandidate);
+    info.options.flags.clr(DxvkShaderCompileFlag::QvfrVirtualSamples);
+    return new DxvkIrShader(info, new ProbeConverter(m_qvfrProbeConverter, std::move(ir), slot));
   }
 
 
@@ -2268,6 +2322,12 @@ namespace dxvk {
     if (m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsResourceIndexing))
       options.descriptorIndexing.optimizeDescriptorIndexing = true;
 
+    std::array<uint16_t, 128> qvfrSamplers = {};
+    if (m_info.options.flags.any(DxvkShaderCompileFlag::QvfrVirtualSamples, DxvkShaderCompileFlag::QvfrVirtualCandidate)) {
+      bool rewrite = m_info.options.flags.test(DxvkShaderCompileFlag::QvfrVirtualSamples);
+      qvfrSamplers = qvfr::lowerVirtualSamples(builder, rewrite,
+        m_info.options.flags.test(DxvkShaderCompileFlag::QvfrUnsafeVirtual));
+    }
     dxbc_spv::ir::legalizeIr(builder, options);
 
     // Generate shader metadata based on the final code
@@ -2275,6 +2335,13 @@ namespace dxvk {
     lowerBindingModelPass.run();
 
     m_metadata = lowerBindingModelPass.getMetadata();
+    if (m_metadata.stage != VK_SHADER_STAGE_FRAGMENT_BIT)
+      m_qvfrProbeConverter = nullptr;
+    m_metadata.qvfrSamplers = qvfrSamplers;
+    for (auto mask : qvfrSamplers)
+      if (mask) m_metadata.flags.set(DxvkShaderFlag::QvfrVirtualSampling);
+    if (!m_metadata.flags.test(DxvkShaderFlag::QvfrVirtualSampling))
+      m_qvfrConverter = nullptr;
     m_layout = lowerBindingModelPass.getLayout();
     m_layout.addSpecDataBuffer(DxvkShaderBinding(m_metadata.stage, SpecDataSet, 0u));
 

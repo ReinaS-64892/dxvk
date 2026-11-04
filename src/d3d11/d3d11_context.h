@@ -780,6 +780,9 @@ namespace dxvk {
             VkImageLayout             OldLayout,
             VkImageLayout             NewLayout);
 
+    // Caller holds the immediate context lock.
+    void FinalizeQvfrForExternalUse();
+
   protected:
 
     D3D11DeviceContextExt<ContextType>        m_contextExt;

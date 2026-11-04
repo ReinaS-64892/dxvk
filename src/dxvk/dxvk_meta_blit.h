@@ -34,6 +34,11 @@ namespace dxvk {
       uint32_t sampler = 0u;
       uint32_t layerIndex = 0u;
       uint32_t layerCount = 0u;
+      VkOffset2D focusDst = { };
+      VkOffset2D focusSrc = { };
+      VkExtent2D focusExtent = { };
+      float focusFade = 0.0f;
+      VkExtent2D focusSourceExtent = { };
     };
 
     /** Look-up info for blit pipeline */
@@ -44,12 +49,15 @@ namespace dxvk {
       VkSampleCountFlagBits   srcSamples  = VK_SAMPLE_COUNT_1_BIT;
       DxvkMetaBlitResolveMode resolveMode = DxvkMetaBlitResolveMode::FilterNearest;
 
+      bool qvfrComposite = false;
+
       bool eq(const Key& other) const {
         return srcViewType  == other.srcViewType
             && dstFormat    == other.dstFormat
             && dstSamples   == other.dstSamples
             && srcSamples   == other.srcSamples
-            && resolveMode  == other.resolveMode;
+            && resolveMode  == other.resolveMode
+            && qvfrComposite == other.qvfrComposite;
       }
 
       size_t hash() const {
@@ -59,6 +67,7 @@ namespace dxvk {
         hash.add(uint32_t(dstSamples));
         hash.add(uint32_t(srcSamples));
         hash.add(uint32_t(resolveMode));
+        hash.add(uint32_t(qvfrComposite));
         return hash;
       }
     };
@@ -113,6 +122,9 @@ namespace dxvk {
       const DxvkMetaBlit::Key&          key,
             VkImageAspectFlagBits       aspect,
       const DxvkPipelineLayout*         layout);
+
+    std::vector<uint32_t> createPsQvfr(
+      const DxvkMetaBlit::Key& key, const DxvkPipelineLayout* layout);
 
     std::vector<uint32_t> createPsSimple(
       const DxvkMetaBlit::Key&          key,
