@@ -53,6 +53,98 @@ GPU の pass timing は begin rendering・attachment load 後から end renderin
 ./qvfr-control.py set profile_passes sampled
 ```
 
+### 画像の古さを許容する QV 継続モード
+
+`unsafe_scene_continue=on` はコード上の既定 off の破綻許容モード。シーンの中間 resolve を毎回通常画像へ確定して再参加する代わりに、学習済みの resolve を省略してアトラスの描画を継続する。通常の scene-only を使い、旧 strict UNSAFE／virtual-post を有効にする設定ではない。再参加モードとは併用せず、このモードを on にすると適用中の scene_resume_after_resolve は off になる。
+
+```sh
+./qvfr-control.py set scene_resume_after_resolve off
+./qvfr-control.py set unsafe_scene_continue on
+./qvfr-control.py set unsafe_resolve_refresh_frames 8
+# 従来の「最初の依存で QV を閉じる」動作へ戻す
+./qvfr-control.py set unsafe_scene_continue off
+```
+
+最初の resolve は実行して内容を作る。その解決画像が、深度テストありの片目 viewport・設定に合うサイズ／MSAA／HDR ビューの描画から実際にサンプルされた場合に、中間画像として学習する。元カラーの image cookie が同じ、または元の解決対象に対応する深度 image cookie を共有することを要求する。RTV／DSV オブジェクトの完全一致は要求せず、同じ画像の別ビューや、共通の深度を使うカラーの ping-pong を学習できる。以降、同じ元画像・保存領域の全体カラー resolve（設定 format、MSAA→単一 sample、AVERAGE）のみ省略候補にする。外部利用を観測した画像と shared 画像は除外する。初めての解決先や元 image cookie が変わった場合と、通常 resolve によらず解決先の保存領域が変わった場合は、通常 resolve からやり直す。
+
+省略するフレームでは、元の MSAA カラーへの QV 合成・resolve・代替 clear／draw は行わず、解決先の前回の内容を使う。private atlas はそのまま保持する。これにより画面取り込み、屈折、背景を読む透過表現等が古くなり、残像や時間差が出得る。用途が途中で変わる画像を完全に識別できるわけではなく、最終出力の自動認識を保証する機能ではない。
+
+`unsafe_resolve_refresh_frames` は 1〜120、既定 8。最後に通常 resolve したフレームからこの間隔が経った場合は、省略せず通常の依存・合成経路へ戻して更新する。1 では resolve を省略しない。同じフレームに通常更新済みの画像も再び省略しない。設定は DXVK のフレーム単位であり、実時間や HMD の表示フレーム数ではない。通常更新のフレームでは QV が従来どおり閉じる場合がある。
+
+その他の依存・対象外描画・提出は既存の終了条件を維持する。scene-only と unsafe_scene_continue がともに on の場合、片目 viewport の直接描画では GS／テッセレーションの存在だけによる除外を解除する。最終段の clip 座標に既存の viewport／scissor 変換を適用し、shader、patch topology、tessellation factor、instance 数は変更しない。query、UAV/storage、transform feedback、layer／viewport export、rasterizer discard、sample-mask export 等の除外は維持する。テッセレーションや GS 自体の処理も周辺・注視で二回行うため、GPU 時間の短縮は実機で比較する。従来の続行 off ではこれらの stage は引き続き通常描画へ戻る。新たな取り込みや再参加は行わない。解決先の履歴は resource cookie／保存領域 ID のみを最大 32 件保持し、外部画像 cookie は最大 256 件。画像への強参照や追加画像・GPU query は作らない。通常の dependency scan に学習用の履歴照合を追加するため、CPU 費用も比較する。
+
+学習候補の発見と省略条件の判定は分離する。全出力が初期化される既知の元 MSAA カラー resolve は、形式／領域が省略条件に合わない場合も読み取りを観測する。`skip_supported=0` の候補を学習しても、省略は行わない。HDR FLOAT 設定に対して、双方が FLOAT ビューを許可する mutable UNORM バッキング形式の resolve も省略候補として扱う。初期化／外部利用の除外は維持する。元画像の保存領域だけが差し替わっても、既に解決先にある内容と学習結果は無効にしない。通常 resolve の実行中に解決先の保存領域が差し替わった場合は、実際の shader 読み取りで参照された保存領域へ初期化記録を結び直す。元 image cookie または解決先の保存領域が別に変わった場合は通常更新からやり直す。
+
+`QVFR unsafe-resolve-candidate` が候補登録、`QVFR unsafe-resolve-learn` が学習、`QVFR unsafe-resolve-skip` が実際の省略。`unsafe-resolve-decision` は resolve の形式、mode、sample 数、寸法、転送範囲、offset、subresource、元画像が cache にあるか、および拒否／通常更新理由を出力する。`unsafe-resolve-reader` は depth/viewport/描画先の形状／無関係な元画像の組／未初期化／external 等の読み取り拒否理由と consumer image cookie・PS を記録する。各理由の初回と profile 計測フレームにつき1回に制限し、累計は stats の `unsafe_decision_*` に残す。
+
+stats の `unsafe_resolve_seen` → `unsafe_resolve_candidates` → `unsafe_resolve_reads` → `unsafe_resolve_readers_learned` → `unsafe_resolves_skipped` で停止段階を確認する。seen はフックへの入力回数、candidates は候補の登録／保存領域変更による再登録回数、reads は観測した候補の sampled-image descriptor 数で、相互に同じ単位ではない。`unsafe_resolve_scans` と `unsafe_resolve_sampled_images` は走査回数と調べた非 null sampled-image 数。シーン形状の読み取りは毎フレーム学習し、それ以外の reader 拒否診断は負荷を抑えるため profile の120フレームごとの計測フレームのみで観測する。コピー／blit／条件を満たす全画面描画を介した読み取りも、元の resolve にさかのぼって学習する。
+
+GrabPass の間接経路用に `resolve → copy／blit／全画面 shader → シーンの読み取り` の由来を追跡する。全画面 shader の対象は単一の直接 draw（3／4／6 vertex または index、instance 1）、全 viewport／scissor、単一カラー出力、深度／stencil／blend 無効、全 RGBA 書き込みで、既知の入力元が一つの場合。頂点内容や shader の意味から Unity GrabPass と断定する仕組みではなく、部分コピーも含めた画像単位の依存推定である。全画面パスを通っただけでは学習せず、その後に従来の深度付きシーン読み取り条件を満たした場合だけ元の resolve を学習する。外部提出した派生画像からは逆に元の resolve を除外する。
+
+由来は最大 128 画像・8 段まで。学習用の派生履歴は同じフレーム内に限り、保存領域変更・上書き・clear・discard と元 resolve の世代変更を確認する。外部提出の判定では保存領域と世代が有効な過去フレームの履歴も参照する。画像の強参照や追加 GPU 転送は保持しない。`QVFR grab-link` の kind=copy/blit/shader、`unsafe-resolve-learn` の via_cookie／hops、`grab-terminal` で経路を確認する。stats の grab_links／grab_indirect_reads／grab_shader_probes／grab_shader_sources／grab_terminals／grab_history と、`grab-reject` および unsafe_decision_grab_* で追跡の停止段階を確認できる。
+
+stats の unsafe_resolves_skipped／unsafe_resolve_readers_learned／unsafe_resolve_refreshes は累計で、refreshes は学習済み・非 external の画像で通常 resolve 経路へ進んだ回数。初回は学習が済むまで速度や QV 範囲が変わらない。中間の color_composites と scene_ends が減ったか、QV 描画が増えたか、GPU 計測区間の合計が短くなったかを確認する。画像を省略せず QV を拡張する実装ではなく、画質の時間的な破綻を引き換えにする実験。
+
+### Resolve 後のシーン再参加実験
+
+`scene_resume_after_resolve=on` はコード上の既定 off の比較用オプション。追加調査ログでは `resolve-read` で一度 QV を終了した後にも、同じサイズの MSAA カラー／深度・片目 viewport・depth test を使う通常描画が残っていた。MSAA resolve を最終ポストプロセスへの移行と一律に見なさず、同じ元のカラー／深度アタッチメントの組へ戻る直接描画だけを既存の QV 安全判定へ再度通す。判定をすべて通り、取り込み・配置の準備が完了した時点で scene cycle を再開する。
+
+```sh
+./qvfr-control.py set scene_resume_after_resolve on
+./qvfr-control.py set scene_resume_after_resolve off
+```
+
+resolve の実行と必要な合成は省略しない。再参加はフレーム内で最大 4 回。depth test のない描画、全幅 viewport、新しい元画像の組は再参加せず通常描画を継続する。対象の元シーンカラーへ実際に native fallback が入った場合と外部 handoff 後は、そのフレームで再参加しない。resolve 以外の理由で終了した場合も再開しない。GS 等の既存の除外条件は維持し、indirect の UNSAFE 条件も緩めない。明示的にシェーダーから UI や Y-flip を認識する機能ではない。
+
+再参加時と同フレームの以後の両眼では、`unsafe_skip_image_seed=on` でも stale なカラー／深度の refresh と必要な初期 import を省略しない。元画像への native 書き込みを atlas に戻す必要があるため。stencil の既存の危険な省略設定はそのまま適用する。中間 resolve ごとの追加合成・取り込みで遅くなる可能性があり、純粋な速度向上は実測で比較する。
+
+`QVFR scene-resume` と stats の累計 `scene_resumes` が再参加の目印。再参加後にも QV 終了があれば `scene_ends` やカラー合成の回数は増える。QV バッチ数、通常パス時間、合成・refresh の追加費用を合わせて確認する。ローディング画面等で深度アタッチメントがない場合を対象にする変更ではない。
+
+### 追加調査用の詳細プロファイル
+
+`profile=on` と `profile_details=on` を指定すると、120 フレームごとの既存計測に CPU の関数別時間と通常描画パスの識別情報を追加する。コード上の既定は off。通常描画を網羅して調べる場合は `profile_passes=full` を使う。sampled でも動作するが、順位は抽出された最大 8 パス内に限られる。QVFR の enabled=off でも詳細計測でき、QV 化されない元の描画を調査できる。
+
+```sh
+./qvfr-control.py set profile on
+./qvfr-control.py set profile_passes full
+./qvfr-control.py set profile_details on
+# 調査後は追加の CPU 時計読み取り・メタデータ収集・ログ出力を停止
+./qvfr-control.py set profile_details off
+```
+
+`QVFR pass-detail {JSON}` は GPU 時間順の通常パス上位 16 件。`frame` と `pass` が識別子で、`gpu_ms` はその物理パス区間の時間、`cpu_ms` は対応する既存の CPU 経過時間。`batches` は記録したアプリ描画バッチ数、`draws` はそのコマンド数（indirect-count は最大数で、実際の GPU 実行数ではない）、`groups` は記録した状態群の数。`QVFR draw-group {JSON}` は対応パスに含まれたシェーダー群・描画状態のスナップショットとその batches/draws。シェーダー列は VS/TCS/TES/GS/FS の順で、カラー全アタッチメント・深度の resource ID、format、寸法、subresource、sample 数、viewport/scissor、instance 数、pipeline flags、depth test/write/compare と stencil test を記録する。instances=-1 は複数コマンドでの混在／間接描画で未知。NaN/Inf の viewport は null として記録する。
+
+パス中の複数シェーダーを一つの GPU 時間へ結び付けて断定しない。draw-group に GPU 時間を配分していないため、混在パスの個別シェーダー時間はまだ分からない。batch/draw の集計は直接・indexed・indirect・indirect-count のアプリ描画で、内部 meta 処理と XFB 特殊描画は識別メタデータに含まない。これらやグループ上限で識別情報を持たないパスも、GPU のパス計測からは除外しない。
+
+`scene` は before-scene／scene-active／after-scene／qvfr-off。`reason` は実際の QV 対象外理由または scene-closed／disabled／indirect-native 等、`scene_end_reason` は当該フレームの QV 終了契機。`static_gate` は現在の描画形状・パイプラインの簡易チェックであり、QV 描画を試行せず取得する。`needs-full-validation` は目立った静的条件に該当しなかったという意味で、安全に QV 化できることを保証しない。QV 終了後にもこの情報が残るため、重い通常パスをどこまで QV に取り込めそうか調べられる。
+
+1 パス最大 32 状態群、1 計測フレーム最大 4096 状態群。超過したバッチは既存群の counts にも加算できない場合に dropped_batches へ数える。パス全体の batches/draws は超過後も数える。`detail-summary` は順位対象数、出力数、metadata_dropped_batches、識別情報がない unattributed_passes、GPU 計測の clipped/native_skipped を記録する。詳細は通常の非同期 query 回収時に出力し、GPU 待機や追加 GPU query を行わない。上位以外のパスのグループ詳細はログに出力しない。
+
+`QVFR cpu-detail` は prepare（QV 判定・準備全体）、eligibility（安全条件の判定）、cache-plan（slot 選択・gaze/配置）、image-dependencies、graphics-state、focus-raster、finish、seed、publish、profile-metadata の関数区間。inclusive_ms は子区間を含み、exclusive_ms は計測された子区間を除く。inclusive を足し合わせない。prepare の exclusive は eligibility/cache/seed 等を除いた準備時間。関数呼び出し単位なので再帰や即時 return も calls に含み、publish 等はアプリ draw の外側でも計測する。このため exclusive の総和が既存 cpu-record に完全一致するとは限らない。profile-metadata はシェーダー等の識別情報の収集・文字列生成の費用で、調査機能自身が追加する負荷の一部を示す。
+
+詳細モードは CPU の時計読み取りと文字列生成・出力を追加するため、性能比較は off でも行う。既存の pass GPU 時間の範囲は変わらず、compute、コピー、rendering 開始前／終了後の処理やフレーム全体は含まない。詳細オフでは新しい CPU 時計と識別メタデータは収集しない。
+
+### 両眼共有アトラス
+
+`stereo_atlas=on`（既定、シーン限定モード）では、同じ元のカラー／深度アタッチメントを使う左右を一組のカラー／深度画像へ描画する。上段に左目の周辺＋注視、下段に右目の周辺＋注視を置き、左右が切り替わってもアタッチメントを維持する。例えば `scale=.25 / focus_scale=1 / focus=.125`、片目 2592×2592 なら共有 atlas は 972×1296、各段の周辺 648×648・注視 324×324。色・深度・stencil の取り込み／refresh／合成、注視枠、viewport／scissor は同じ段オフセットを使用する。視線は既存どおりフレーム単位で固定し、視線移動だけでは再確保しない。
+
+元のアタッチメントが異なる組どうしは共有しない。cache slot の再利用で以前の相手眼が画像を保持している場合、その組を上書きせず別の画像を使う。共有サイズがデバイスの画像／framebuffer 上限を超える場合はその組を従来の片目アトラスへ戻す。旧 virtual／UNSAFE モードは従来の片目配置を使う。設定変更は以前の領域を確定してから行い、切り替え直後は必要な再確保が発生する。
+
+```sh
+./qvfr-control.py set stereo_atlas off
+./qvfr-control.py set stereo_atlas on
+```
+
+`QVFR control` の `stereo_atlas` は適用した要求、`atlas-create` の同名フィールドと extent は実際の配置。stats の `stereo_atlas_shares` は相手眼の画像へ合流した累計回数、`stereo_eye_pass_keeps` は左右切り替え時に同じアトラスのパスを維持して次の draw に入れた累計回数、`stereo_atlas_fallbacks` は上限により片目配置へ戻した seed 回数。通常は shares が初期化後に落ち着き、視線追従中も rebuild が増えず、eye_pass_keeps が増える。`atlas_pass_ends`／`atlas_target_breaks` と CPU 記録時間を有効な stats 区間の差分で比較する。GPU draw／頂点処理は四領域分残り、別の元画像への切り替え、実際のリソース依存、合成・取り込み等ではパスを終了する。
+
+### 直接描画ペアの CPU 処理削減
+
+シーン限定モードの直接描画（indexed を含む、1 コマンドのバッチ）では、周辺／注視の二領域を一度の graphics state commit から発行する。注視側では viewport／scissor の動的状態だけを更新し、pipeline、descriptor、vertex/index buffer、resource hazard の確認を繰り返さない。元の instanceCount／firstInstance と描画順を維持する。QV の既存の安全判定（storage descriptor、transform feedback、query、viewport/layer export などの除外）を通った描画だけが対象。draw trace 有効時、複数コマンドのバッチ、旧 UNSAFE／post／indirect は従来経路を使う。GPU draw 命令自体は周辺・注視の二回であり、二回の頂点処理は残る。
+
+`QVFR stats` の `direct_pairs` がこの経路を発行した累計ペア数。`paired_in_one_pass` は従来からのペア内の同一パス維持数。追加の `atlas_continuations` は前の atlas pass が有効なまま同じアタッチメントで次の QV draw に入れた回数、`atlas_eye_switches` は有効な atlas pass から別眼の cache slot へ切り替えた回数。後者はパス終了理由の厳密な分類ではない。
+
+実際の atlas pass 終了を `atlas_pass_ends` に数え、`atlas_target_breaks`（updateRenderTargets による更新）、`atlas_command_breaks`（command list 終了／分割）、`atlas_hazard_breaks`（graphics resource hazard）、`atlas_descriptor_breaks`（descriptor range の再確保）、`atlas_resolve_breaks`（shader binding による implicit resolve）、残りの `atlas_other_breaks` に分ける。カウンターは profile=off でも動作し、追加の GPU query は発行しない。有効な stats 間の差分で比較する。GPU の pass 数／FPS の改善は実行後のログで判断する。
+
 ### 危険な取り込み・合成省略（シーン限定モード）
 
 次の 3 項目はすべて既定 `off`。`qvfr-control.txt` で個別に切り替えられる。`SCENE_ONLY=0` の旧実験モードでは適用しない。既存の UNSAFE replay を有効にする必要はない。
@@ -616,3 +708,60 @@ attachment のシリアライズでは format の enum と mip の `uint8_t` を
 CPU のテストは領域計算、atlas 内の矩形の非重複・両目と端の視線の Viewport／Scissor の対応、カラー／深度／ステンシルの独立した確定と後続描画による dirty 化、深度を取り込み直した後の stencil の保持、両眼キャッシュの保持・画像依存・LRU 退避、共有視線の heartbeat、JSON 出力と集計を検査する。virtual のテストは左右の UV と crop／境界 clamp、通常シェーダーを変えない候補判定、通常／近似各 8 パターン（計 16）の sampling 対応判定、通常の Sample と近似 offset／grad／寸法参照の生成 SPIR-V の構造検証を含む。この環境では Wine のコンソールテストも `Bad system call` で停止するため、これらのテストと Windows DLL のビルド成功は GPU 動作の確認を意味しない。
 
 2026-11-04 の残像修正: `logs/strict-unsafe-left-frozen-20261104` に旧 DLL のログと manifest を保存。フレーム 1800→1920 では scene replay は 480 回、post cache replay は 23952 回増え、描画省略は 46 のまま。片目 viewport や深度／stencil を使う描画まで post 経路が受け付けると、両眼 replay とカラーだけの更新管理になり、scene cache の更新を迂回するため、全幅・カラー処理に制限した。また深度／stencil の clear 後、保持した atlas の該当データを stale として取り込み直す。分割維持と提出先候補での通常描画への切り替えは継続する。起動ログの `post_classification=fullwidth-color-only` が修正版の目印。実機の残像解消は未確認。
+
+### GS／テッセレーション続行と画像依存確認
+
+`QVFR advanced-replay` は GS またはテッセレーションを初めて QV 描画した時の stage 名を記録する。stats の geometry_batches／tessellation_batches は各 stage を含む QV アプリ描画バッチ数で、両方を含むバッチは両方へ数える。advanced_batches はその和ではなく和集合。再参加モードは不要で、現在の unsafe_scene_continue=on で適用する。
+
+画像依存確認では、保留中の元画像と virtual 画像だけを publication 処理へ通す。同一走査内で画像単位の読み取りをまとめるが、depth／stencil 等の異なる aspect と sampled-image の学習は別々に保持する。32 件の固定テーブルが満杯なら従来どおり確認し、依存を省略しない。走査終了時に履歴を捨てるため、次の draw／転送／書き込みを越えた省略はしない。dependency_images は処理した画像アクセス数（異なる aspect／学習追加は別アクセス）、dependency_duplicates はまとめた重複アクセス数、dependency_unrelated は保留／virtual 画像に無関係として publication 呼び出しを省いた数。通常テクスチャでも resolve 学習の必要な確認は残す。unsafe_resolve_sampled_images は従来どおり descriptor 数、unsafe_resolve_reads は同一走査内の重複を除いた候補画像の観測数になる。
+
+### 通常の全画面描画・転送経路の調査
+
+`profile=on` と `profile_details=on` の120フレームごとの計測フレームでは、`QVFR flow {JSON}` も出力する。追加の GPU query、readback、画像コピー、shader 差し替えは行わない。ログ生成の CPU 費用は計測フレームの命令記録へ含まれる。描画結果や既存の QV 終了条件は変更しない。
+
+対象は通常描画のうち depth test 無効で、出力が設定画像の幅・高さの各1/4以上のパス。kind=draw に出力／深度 view、使用中の sampled-image binding（最大16件、超過は inputs_dropped）、shader 名、viewport／scissor、blend／write mask、純 sampler の filter／address 設定（最大16件）を記録する。backend_slot は DXVK 内部の resource index であり、D3D の t/s レジスター番号や画像と sampler の使用組を直接示さない。cookie は画像オブジェクトの識別子、storage は保存領域の識別子で、view の FLOAT と元画像の UNORM の違いも別々に残す。sampler が combined descriptor に組み込まれた場合は純 sampler リストに含まれない。
+
+kind=transfer-request は既存の copy／blit／resolve の論理要求で、実際の GPU 転送の実行や時間を保証しない。元／先の subresource と矩形を記録し、resolve-skip は既存の省略経路に入ったことを示す。compose-color はカラー合成の開始、external は外部利用の通知。frame と seq はこれらの記録対象イベントの順序であり、全 draw／全 GPU 命令の順序ではない。記録対象から除外した描画・内部 meta 処理もあるため、最後の記録された writer が内容の唯一の由来とは限らない。各コンテキスト・計測フレームで全種類合計128件まで、超過は stats の flow_dropped に出す。
+
+`draw.pass` は既存の pass-detail の番号へ結び付く。パス GPU 時間を画像や個別 shader へ配分しない。次のコマンドで最新の計測フレーム（または --frame 13920 のように指定）の入出力を並べられる。
+
+```sh
+python3 dxvk/tools/qvfr_flow.py logs/VRChat_d3d11.log
+```
+
+解析器の producer は同じフレーム・同じ cookie/storage に最後に記録された draw／compose の番号を示す依存候補。転送要求を writer として扱わず、未観測なら unobserved を示す。部分書き込みや未記録の描画を補完するものではなく、全画像コピーや shader の等価性を判定する機能ではない。
+
+### HDR 描き戻しの省略実験
+
+`unsafe_skip_hdr_return=on` は既定 off。scene-only と unsafe_scene_continue が有効な時だけ適用する。ログで観測した VS `vs.09f46cdd7650c27388161a211b5e17d5`／PS `fs.f0bde3d56fe0f0cceffcb66b525c3952` の往復のうち、一時 HDR から元 MSAA HDR への描き戻しだけを省く。最初の resolve と一時 HDR への描画は実行し、一時画像の別用途は維持する。約0.85 msの往復全体を省く機能ではなく、前ログで約0.44 msだった復路パスが対象。最終 sRGB 出力、複数入力の全幅効果、深度・stencil・UI の描画は対象外。
+
+同じ DXVK フレームで通常 resolve 済みの元 MSAA 画像を特定でき、片目 viewport の単一 draw（3／4／6 vertex または index、instance 1）、HDR FLOAT view、入力1枚、linear/clamp sampler、blend・depth test/write・stencil・logic op 無効、全 RGBA 書き込み、全サンプル有効、viewport 全体を覆う scissor の場合だけ往路を記録する。query、storage、transform feedback、layer/viewport/sample-mask export 等は除外する。復路は同じ元画像・保存領域を参照する場合に、記録済みの目について一度だけ省く。元画像・解決画像・一時画像への別の書き込み、clear/discard、保存領域変更、外部利用、設定変更で無効化し、フレームをまたがない。左右の検証済み往路は相手の目の記録を維持する。最大4経路・数値IDのみで画像への強参照や追加 GPU 処理は保持しない。
+
+これは shader の等価性を証明する最適化ではない。shader の定数／UV・上下反転変換が往復で相殺されると仮定し、元 MSAA 画像の各サンプルを保持する。通常の往復は解決後の値を各サンプルへ書くため、輪郭・アンチエイリアス・色や向きが変わる可能性がある。省略前のカラーが正しいかは実機で比較する。
+
+```sh
+./qvfr-control.py set unsafe_skip_hdr_return on
+./qvfr-control.py set unsafe_skip_hdr_return off
+```
+
+`QVFR hdr-return-capture` は往路の記録、`hdr-return-skip` は復路の省略。stats の hdr_return_shader_draws／hdr_return_candidates／hdr_return_attempts／hdr_return_skipped で条件通過と適用数を確認する。flow の hdr-return-skip も同じフレームの経路に残る。対象の native パスが消えたか、GPU 合計が短縮したかを確認する。省略した GPU パスの時間を直接測った値ではない。
+
+### 重複 resolve の再利用と HDR 往路の遅延
+
+`resolve_reuse=on`（既定 off）は同じ DXVK フレーム・同じ source/destination cookie と保存領域・同じ format/sample/全領域の通常カラー resolve の結果を再利用する。対象は設定サイズの単一 mip/layer 2D HDR FLOAT、MSAA→単一 sample、AVERAGE。shared／既知の外部画像／host-visible 画像は除外する。最大8件の数値履歴のみ。元画像／先画像への書き込み、clear/discard、外部利用、カラー合成、設定変更で無効化し、QV atlas に新しい保留カラーがある場合も再利用しない。通常 resolve の経路に進んだものだけを記録し、既存の破綻許容 stale resolve で省いた要求は登録しない。Vulkan inline resolve では実行が後に予定されることがあるが、その pending resolve を取り消す機能ではない。
+
+`unsafe_defer_hdr_forward=on`（既定 off）は unsafe_skip_hdr_return が適用中の時だけ有効。既存の検証済み往路で、pipeline／descriptor／render pass の設定は通常どおり行い、単一の draw 命令だけを command list 内に保留する。次の Vulkan 命令（viewport 更新・barrier・別描画・copy・query 等）、descriptor heap の再 bind、secondary buffer 切替、command list の finalize／next があれば、保留 draw を元の物理状態で直前に発行する。別コンテキストや別フレームへ replay 状態を持ち越さず、CPU側の描画状態を丸ごと保存・復元しない。debug checkpoint／draw trace 有効時は遅延しない。
+
+その GPU 命令が入る前に対応する復路を省けた場合だけ、同じ tracking ID と経路・目に属する保留 draw を取り消す。保留は1件なので、左右の間に viewport 更新が入る通常の順序では先行する目の往路は発行され、後行する目だけを取り消せる場合がある。往路パスの約0.44 ms全体を常に削れるという意味ではない。往路の GPU リソース準備や pass の開始／終了費用も残る。
+
+取り消しは、ログで観測した一時画像がその復路で役目を終えるという追加の仮定を置く。保留中に別の GPU 操作が来た場合は本来の shader draw を発行できるが、取り消し後に同じ一時画像を別用途で読む場合、そのフレームの内容は復元できず古い内容になりうる。sampled/storage/input attachment の通常走査・画像アクセス・外部利用でその読み取りを観測したら `hdr-forward-late-read` を出し、往路遅延を以後無効にする。stats の unsafe_defer_hdr_forward は実適用状態で、要求値はファイルに残る。設定を変更すると再適用される。UV／色／MSAA サンプルの等価性を保証しない点は復路省略と同じ。
+
+```sh
+./qvfr-control.py set resolve_reuse on
+./qvfr-control.py set unsafe_defer_hdr_forward on
+# 各機能を独立して比較
+./qvfr-control.py set resolve_reuse off
+./qvfr-control.py set unsafe_defer_hdr_forward off
+```
+
+stats の resolve_reuse_hits／resolve_reuse_records と hdr_forward_deferred／hdr_forward_cancelled／hdr_forward_late_reads を確認する。deferred は保留数で、取り消せず通常発行された数は（残存保留がない境界で）deferred-cancelled。flow の resolve-reuse／hdr-forward-defer／hdr-forward-cancel は同一フレーム内の要求と取り消しの対応に使う。draw の既存 CPU profile metadata は保留時点で採取されるため、cancel が付いた draw は実際の GPU draw と数えない。pass 自体や他の目の draw は残りうるので、同じ pass の GPU 時間を二重計上せず、通常パス時間と GPU 計測合計で評価する。

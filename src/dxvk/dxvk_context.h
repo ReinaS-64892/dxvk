@@ -16,7 +16,7 @@ namespace dxvk {
 
   struct DxvkQvfrState;
   namespace qvfr { struct ControlSettings; }
-  namespace qvfr { struct Rect; }
+  namespace qvfr { struct Rect; struct GrabToken; }
 
   /**
    * \brief DXVK context
@@ -1350,6 +1350,21 @@ namespace dxvk {
     void applyQvfrControl(const qvfr::ControlSettings& settings, bool initial);
     void drawQvfrSourceOutline(size_t index);
     bool beginQvfrDraw();
+    bool qvfrSceneAllowsDraw();
+    qvfr::GrabToken qvfrGrabSource(const DxvkImage& image, bool external = false);
+    void noteQvfrGrabTransfer(const DxvkImage& destination, qvfr::GrabToken source, const char* kind);
+    qvfr::GrabToken prepareQvfrGrabDraw(bool suitable, Rc<DxvkImage>* destination);
+    void invalidateQvfrGrabImage(const DxvkImage& image);
+    void invalidateQvfrGrabWrites(bool compute);
+    void finishQvfrGrabResolve(const DxvkImage& destination);
+    bool prepareQvfrHdrReturn(bool suitable);
+    void finishQvfrHdrReturn();
+    void noteQvfrHdrForwardRead(const DxvkImage& image);
+    bool qvfrResolveReuseKey(const DxvkImage& dst, const DxvkImage& src,
+      const VkImageResolve& region, VkFormat format, VkResolveModeFlagBits mode, VkResolveModeFlagBits stencilMode) const;
+    void noteQvfrGrabExternal(const DxvkImage& image);
+    bool tryQvfrUnsafeSceneResolve(const Rc<DxvkImage>& dst, const Rc<DxvkImage>& src,
+      const VkImageResolve& region, VkFormat format, VkResolveModeFlagBits mode, VkResolveModeFlagBits stencilMode);
     void finishQvfrScene(const char* reason);
     bool beginQvfrPostDraw();
     void nextQvfrPostDraw(uint32_t pass);
@@ -1375,6 +1390,13 @@ namespace dxvk {
     size_t beginQvfrTiming(const char* phase);
     void endQvfrTiming(size_t index);
     void pollQvfrTimings();
+    void noteQvfrProfileDraw(const char* kind, uint32_t count, int64_t instances, uint32_t firstInstance);
+    bool takeQvfrFlowEvent();
+    void noteQvfrFlowDraw(const char* kind, uint32_t count, int64_t instances);
+    void noteQvfrFlowImage(const char* kind, const DxvkImage& image, const DxvkImage* source = nullptr);
+    void noteQvfrFlowTransfer(const char* kind, const DxvkImage& src, const DxvkImage& dst,
+      const VkImageSubresourceLayers& srcSub, VkOffset3D src0, VkOffset3D src1,
+      const VkImageSubresourceLayers& dstSub, VkOffset3D dst0, VkOffset3D dst1);
     bool beginQvfrOrientationProbe();
     void nextQvfrOrientationProbe(uint32_t point);
     void endQvfrOrientationProbe();

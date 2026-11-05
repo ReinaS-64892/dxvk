@@ -249,6 +249,7 @@ namespace dxvk {
   void DxvkContext::traceQvfrOrientationTransfer(const char* kind, const DxvkImage& src, const DxvkImage& dst,
       const VkImageSubresourceLayers& srcSub, VkOffset3D src0, VkOffset3D src1,
       const VkImageSubresourceLayers& dstSub, VkOffset3D dst0, VkOffset3D dst1) {
+    noteQvfrFlowTransfer(kind, src, dst, srcSub, src0, src1, dstSub, dst0, dst1);
     if (!m_qvfr || !m_qvfr->orientationTrace || m_qvfrBusy) return;
     auto& q = *m_qvfr;
     auto sequence = ++q.orientationSequence;

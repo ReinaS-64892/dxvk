@@ -23,6 +23,15 @@ int main(int argc, char**) {
   check(!dxvk::qvfr::parseControl(std::string_view("on\0", 3)).has_value());
   using namespace dxvk::qvfr;
   ControlSettings old;
+  check(!old.unsafeSkipHdrReturn);
+  check(!old.resolveReuse && !old.unsafeDeferHdrForward);
+  auto extra = parseControlSettings("resolve_reuse=on\nunsafe_defer_hdr_forward=on\n", old);
+  check(extra && extra->resolveReuse && extra->unsafeDeferHdrForward && *extra != old);
+  check(!parseControlSettings("resolve_reuse=maybe\n", old));
+  auto hdrReturn = parseControlSettings("unsafe_skip_hdr_return=on\n", old);
+  check(hdrReturn && hdrReturn->unsafeSkipHdrReturn && *hdrReturn != old);
+  check(!parseControlSettings("unsafe_skip_hdr_return=maybe\n", old));
+  check(!parseControlSettings("unsafe_skip_hdr_return=off\n", *hdrReturn)->unsafeSkipHdrReturn);
   old.profile = true; old.samples = 4; old.gaze = "fixed";
   auto config = parseControlSettings("# override old launch options\nenabled=off\nprofile=off\n"
     "gaze=shared\nsize=5184x2592\nsamples=2\nscale=0.5\nfocus=.25\n"
@@ -47,6 +56,26 @@ int main(int argc, char**) {
     check(parsed->profile && parsed->samples == 4);
     check((*parsed != old) == bool(mask));
   }
+  check(!old.unsafeSceneContinue && old.unsafeResolveRefreshFrames == 8);
+  auto stale = parseControlSettings("unsafe_scene_continue=on\nunsafe_resolve_refresh_frames=12", old);
+  check(bool(stale) && stale->unsafeSceneContinue && stale->unsafeResolveRefreshFrames == 12 && *stale != old);
+  for (auto invalid : {"0", "121", "-1", "1.5"})
+    check(!parseControlSettings(std::string("unsafe_resolve_refresh_frames=") + invalid));
+  check(!old.sceneResumeAfterResolve);
+  auto resume = parseControlSettings("scene_resume_after_resolve=on", old);
+  check(bool(resume) && resume->sceneResumeAfterResolve && *resume != old);
+  check(!parseControlSettings("scene_resume_after_resolve=off", *resume)->sceneResumeAfterResolve);
+  check(!parseControlSettings("scene_resume_after_resolve=maybe"));
+  check(!old.profileDetails);
+  auto details = parseControlSettings("profile_details=on", old);
+  check(bool(details) && details->profileDetails && *details != old && details->profile);
+  check(!parseControlSettings("profile_details=off", *details)->profileDetails);
+  check(!parseControlSettings("profile_details=maybe"));
+  check(old.stereoAtlas);
+  auto separate = parseControlSettings("stereo_atlas=off", old);
+  check(bool(separate) && !separate->stereoAtlas && *separate != old);
+  check(parseControlSettings("stereo_atlas=on", *separate)->stereoAtlas);
+  check(!parseControlSettings("stereo_atlas=invalid", old));
   auto composite = parseControlSettings("unsafe_skip_depth_compose=on\ncolor_single_pass=off\ncolor_fade_pixels=24");
   check(bool(composite) && composite->unsafeSkipDepthCompose && !composite->colorSinglePass && composite->colorFadePixels == 24);
   check(!old.unsafeSkipDepthCompose && old.colorSinglePass && old.colorFadePixels == 0);

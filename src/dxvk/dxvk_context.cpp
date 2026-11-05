@@ -113,6 +113,7 @@ namespace dxvk {
     const VkDebugUtilsLabelEXT*       reason) {
     // Relocation can materialize deferred QVFR images. Close their barriers
     // together with the rest of the command list after relocation completes.
+    if (m_qvfr && m_qvfr->atlasPass) m_qvfr->atlasCommandBreaks++;
     this->endCurrentPass(true);
     this->relocateQueuedResources();
     this->endCurrentCommands();
@@ -257,6 +258,18 @@ namespace dxvk {
     const Rc<DxvkImageView>&    srcView,
     const VkOffset3D*           srcOffsets,
           VkFilter              filter) {
+    // Region transfers carry dependency lineage, not a claim that every
+    // destination pixel is an exact copy. This also covers per-eye grabs.
+    bool trackGrabBlit = dstView->info().mipIndex == 0 && dstView->info().layerIndex == 0
+      && dstView->info().layerCount == 1 && dstView->info().aspects == VK_IMAGE_ASPECT_COLOR_BIT
+      && srcView->info().aspects == VK_IMAGE_ASPECT_COLOR_BIT
+      && dstOffsets[0].z == 0 && dstOffsets[1].z == 1
+      && dstOffsets[0].x != dstOffsets[1].x && dstOffsets[0].y != dstOffsets[1].y;
+    auto grabSource = trackGrabBlit && dstView->image() != srcView->image()
+      ? qvfrGrabSource(*srcView->image()) : qvfr::GrabToken();
+    auto grabTransfer = qvfr::grabScopeExit([&] {
+      if (grabSource) noteQvfrGrabTransfer(*dstView->image(), grabSource, "blit");
+    });
     noteQvfrTerminalWrite(*dstView->image(), "blit");
     traceQvfrOrientationTransfer("blit", *srcView->image(), *dstView->image(),
       vk::pickSubresourceLayers(srcView->subresources(), 0), srcOffsets[0], srcOffsets[1],
@@ -399,6 +412,7 @@ namespace dxvk {
           VkImageAspectFlags    clearAspects,
           VkClearValue          clearValue,
           VkImageAspectFlags    discardAspects) {
+    invalidateQvfrGrabImage(*attachment.view->image());
     prepareQvfrFullClear(attachment.view.ptr(), clearAspects | discardAspects);
     // Make sure the color components are ordered correctly
     if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -467,6 +481,7 @@ namespace dxvk {
           VkExtent3D            extent,
           VkImageAspectFlags    aspect,
           VkClearValue          value) {
+    invalidateQvfrGrabImage(*imageView->image());
     auto clearExtent = imageView->mipLevelExtent(0);
     if (!offset.x && !offset.y && !offset.z && extent.width==clearExtent.width
      && extent.height==clearExtent.height && extent.depth==clearExtent.depth)
@@ -597,6 +612,14 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    bool trackGrabCopy = dstSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+      && srcSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+      && !dstSubresource.mipLevel && !dstSubresource.baseArrayLayer && dstSubresource.layerCount == 1
+      && extent.width && extent.height && extent.depth == 1;
+    auto grabSource = trackGrabCopy && dstImage != srcImage ? qvfrGrabSource(*srcImage) : qvfr::GrabToken();
+    auto grabTransfer = qvfr::grabScopeExit([&] {
+      if (grabSource) noteQvfrGrabTransfer(*dstImage, grabSource, "copy");
+    });
     noteQvfrTerminalWrite(*dstImage, "copy");
     traceQvfrOrientationTransfer("copy", *srcImage, *dstImage,
       srcSubresource, srcOffset, {srcOffset.x + int32_t(extent.width), srcOffset.y + int32_t(extent.height), srcOffset.z + int32_t(extent.depth)},
@@ -891,6 +914,7 @@ namespace dxvk {
 
   void DxvkContext::discardImage(
     const Rc<DxvkImage>&          image) {
+    invalidateQvfrGrabImage(*image);
     flushQvfrImage(image.ptr(), "discard");
     VkImageUsageFlags imageUsage = image->info().usage;
 
@@ -1480,6 +1504,7 @@ namespace dxvk {
           Rc<DxvkResourceAllocation>&& slice,
     const DxvkImageUsageInfo&       usageInfo,
           VkImageLayout             layout) {
+    invalidateQvfrGrabImage(*image);
     flushQvfrImage(image.ptr(), "image-invalidate");
     VkImageUsageFlags usage = image->info().usage;
 
@@ -1717,7 +1742,7 @@ namespace dxvk {
       // Once scene-end closes replay, later application draws need no QVFR
       // replay eligibility checks. Deferred plane dependencies stay below.
       // Optional UV probes above still run for the final Y flip investigation.
-      if (!m_qvfr->sceneOnly || m_qvfr->sceneCycle.allows(m_frameCount)) {
+      if (!m_qvfr->sceneOnly || qvfrSceneAllowsDraw()) {
         prepareQvfrVirtualReads();
         flushQvfrShaderImages(false);
         bool singleInstance = count != 0;
@@ -1745,9 +1770,33 @@ namespace dxvk {
           m_qvfr->replayEye = eye;
           if (replayInstances && beginQvfrDraw()) {
             m_qvfr->instancedBatches += !singleInstance;
-            drawGeneric<Indexed>(count, draws);
-            focusQvfrDraw();
-            drawGeneric<Indexed>(count, draws);
+            if (count == 1 && m_qvfr->sceneOnly && !m_qvfrTraceEnabled) {
+              // beginQvfrDraw rejects storage writes, transform feedback,
+              // queries and shader viewport/layer exports. Both disjoint
+              // tiles therefore share all resources and pipeline state.
+              // Commit once; only viewport/scissor change for the focus draw.
+              if (this->commitGraphicsState<Indexed, false>()) {
+                auto emit = [&] {
+                  if constexpr (Indexed) {
+                    m_cmd->cmdDrawIndexed(draws->indexCount, draws->instanceCount,
+                      draws->firstIndex, draws->vertexOffset, draws->firstInstance);
+                  } else {
+                    m_cmd->cmdDraw(draws->vertexCount, draws->instanceCount,
+                      draws->firstVertex, draws->firstInstance);
+                  }
+                };
+                emit();
+                focusQvfrDraw();
+                this->updateDynamicState();
+                emit();
+                m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 2u);
+                m_qvfr->directPairs++;
+              }
+            } else {
+              drawGeneric<Indexed>(count, draws);
+              focusQvfrDraw();
+              drawGeneric<Indexed>(count, draws);
+            }
             endQvfrDraw();
             replayed = true;
           }
@@ -1760,13 +1809,35 @@ namespace dxvk {
         if (dropUnsafeQvfrDraw()) return;
         flushQvfrDrawTargets(m_qvfr->lastSkip);
       } else if (m_qvfr->lazyDepthStencil) {
+        m_qvfr->lastSkip = "scene-closed";
         // Scene replay stays closed, but deferred depth/stencil may still be
         // observed by a native draw. Publish only on a real dependency.
         flushQvfrShaderImages(false);
         flushQvfrDrawTargets("scene-native");
       }
     }
+    uint32_t grabVertices = 0;
+    if (count == 1) {
+      if constexpr (Indexed) grabVertices = draws[0].indexCount;
+      else grabVertices = draws[0].vertexCount;
+    }
+    bool simpleQuad = count == 1 && (grabVertices == 3 || grabVertices == 4 || grabVertices == 6)
+      && draws[0].instanceCount == 1 && !draws[0].firstInstance;
+    if (prepareQvfrHdrReturn(simpleQuad)) {
+      restoreQvfrVirtualReads();
+      return;
+    }
+    auto hdrReturn = qvfr::grabScopeExit([&] { if (m_qvfr && !m_qvfrBusy) m_qvfr->hdrReturnWriting = {}; });
     if (this->commitGraphicsState<Indexed, false>()) {
+      auto hdrRecord = qvfr::grabScopeExit([&] { if (!m_qvfrBusy) finishQvfrHdrReturn(); });
+      Rc<DxvkImage> grabDestination;
+      auto grabSource = prepareQvfrGrabDraw(count == 1 && (grabVertices == 3 || grabVertices == 4 || grabVertices == 6)
+        && draws[0].instanceCount == 1 && !draws[0].firstInstance, &grabDestination);
+      auto grabDraw = qvfr::grabScopeExit([&] {
+        if (grabDestination) noteQvfrGrabTransfer(*grabDestination, grabSource, "shader");
+      });
+      noteQvfrProfileDraw(Indexed ? "indexed" : "direct", count,
+        count == 1 ? int64_t(draws[0].instanceCount) : -1, count == 1 ? draws[0].firstInstance : 0);
       if (m_qvfr && !m_qvfrBusy && count) {
         m_qvfr->nativeDirectBatches++;
         m_qvfr->nativeDirectDraws += count;
@@ -1778,15 +1849,28 @@ namespace dxvk {
       }
       if (count == 1u) {
         // Most common case, just emit a single draw
-        if constexpr (Indexed) {
-          m_cmd->cmdDrawIndexed(draws->indexCount, draws->instanceCount,
-            draws->firstIndex, draws->vertexOffset, draws->firstInstance);
-        } else {
-          m_cmd->cmdDraw(draws->vertexCount, draws->instanceCount,
-            draws->firstVertex, draws->firstInstance);
+        uint64_t deferred = 0;
+        if (m_qvfr && !m_qvfrBusy && m_qvfr->unsafeDeferHdrForward
+         && m_qvfr->hdrReturnWriting.temporary && !m_qvfrTraceEnabled) {
+          if constexpr (Indexed) deferred = m_cmd->deferQvfrDraw(true, draws->indexCount, draws->firstIndex, draws->vertexOffset);
+          else deferred = m_cmd->deferQvfrDraw(false, draws->vertexCount, draws->firstVertex, 0);
+          if (deferred) {
+            auto& q = *m_qvfr;
+            q.hdrForwardTicket = deferred; q.hdrForwardTracking = m_trackingId;
+            q.hdrForwardPath = q.hdrReturnWriting; q.hdrForwardDeferred++;
+            noteQvfrFlowImage("hdr-forward-defer", *m_state.om.renderTargets.color[0].view->image());
+          }
         }
-
-        m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1u);
+        if (!deferred) {
+          if constexpr (Indexed) {
+            m_cmd->cmdDrawIndexed(draws->indexCount, draws->instanceCount,
+              draws->firstIndex, draws->vertexOffset, draws->firstInstance);
+          } else {
+            m_cmd->cmdDraw(draws->vertexCount, draws->instanceCount,
+              draws->firstVertex, draws->firstInstance);
+          }
+          m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1u);
+        }
       } else if (unlikely(needsDrawBarriers())) {
         // If the current pipeline has storage resource hazards,
         // unroll draws and insert a barrier after each one.
@@ -1900,6 +1984,7 @@ namespace dxvk {
           uint32_t                  stride,
           bool                      unroll) {
     DxvkQvfrCpuScope cpuScope(m_qvfr.get(), m_qvfrBusy, m_frameCount);
+    if (m_qvfr && !m_qvfrBusy) m_qvfr->lastSkip = "indirect-native";
     if (beginQvfrTerminalDraw()) {
       m_qvfrBusy = true;
       drawIndirectGeneric<Indexed>(offset, count, stride, unroll);
@@ -1954,6 +2039,7 @@ namespace dxvk {
     }
 
     if (this->commitGraphicsState<Indexed, true>()) {
+      noteQvfrProfileDraw(Indexed ? "indexed-indirect" : "indirect", count, -1, 0);
       if (likely(count == 1u || !unroll || !needsDrawBarriers())) {
         if (unlikely(m_qvfrTraceEnabled))
           traceQvfrDraw(Indexed ? "indexed-indirect" : "indirect", count, -1, 0);
@@ -2015,6 +2101,7 @@ namespace dxvk {
           uint32_t              maxCount,
           uint32_t              stride) {
     DxvkQvfrCpuScope cpuScope(m_qvfr.get(), m_qvfrBusy, m_frameCount);
+    if (m_qvfr && !m_qvfrBusy) m_qvfr->lastSkip = "indirect-native";
     if (beginQvfrTerminalDraw()) {
       m_qvfrBusy = true;
       drawIndirectCountGeneric<Indexed>(offset, countOffset, maxCount, stride);
@@ -2071,6 +2158,7 @@ namespace dxvk {
     }
 
     if (this->commitGraphicsState<Indexed, true>()) {
+      noteQvfrProfileDraw(Indexed ? "indexed-indirect-count" : "indirect-count", maxCount, -1, 0);
       if (unlikely(m_qvfrTraceEnabled))
         traceQvfrDraw(Indexed ? "indexed-indirect-count" : "indirect-count", maxCount, -1, 0);
       if (Indexed) {
@@ -2133,6 +2221,27 @@ namespace dxvk {
       {region.srcOffset.x + int32_t(region.extent.width), region.srcOffset.y + int32_t(region.extent.height), region.srcOffset.z + int32_t(region.extent.depth)},
       region.dstSubresource, region.dstOffset,
       {region.dstOffset.x + int32_t(region.extent.width), region.dstOffset.y + int32_t(region.extent.height), region.dstOffset.z + int32_t(region.extent.depth)});
+    bool reuseEligible = qvfrResolveReuseKey(*dstImage, *srcImage, region, format, mode, stencilMode);
+    auto reuseKey = [&] {
+      return qvfr::ResolveReuseKey{m_frameCount, srcImage->cookie(), uint64_t(srcImage->getResourceId()),
+        dstImage->cookie(), uint64_t(dstImage->getResourceId()), uint32_t(format),
+        uint32_t(srcImage->info().sampleCount), region.extent.width, region.extent.height};
+    };
+    if (reuseEligible && m_qvfr->resolveReuseHistory.contains(reuseKey())) {
+      auto n = ++m_qvfr->resolveReuseHits;
+      if (n <= 8 || !(m_frameCount % 120))
+        Logger::info(str::format("QVFR resolve-reuse frame=", m_frameCount,
+          " source_cookie=", srcImage->cookie(), " destination_cookie=", dstImage->cookie(), " hits=", n));
+      noteQvfrFlowImage("resolve-reuse", *dstImage, srcImage.ptr());
+      return;
+    }
+    if (tryQvfrUnsafeSceneResolve(dstImage, srcImage, region, format, mode, stencilMode)) return;
+    auto reuseRecord = qvfr::grabScopeExit([&] {
+      if (reuseEligible && qvfrResolveReuseKey(*dstImage, *srcImage, region, format, mode, stencilMode)) {
+        m_qvfr->resolveReuseHistory.record(reuseKey()); m_qvfr->resolveReuseRecords++;
+      }
+    });
+    auto grabResolve = qvfr::grabScopeExit([&] { finishQvfrGrabResolve(*dstImage); });
     if (mode == VK_RESOLVE_MODE_AVERAGE_BIT && stencilMode == VK_RESOLVE_MODE_NONE
      && tryQvfrVirtualCopy(dstImage, srcImage, region.dstSubresource, region.dstOffset,
         region.srcSubresource, region.srcOffset, region.extent, true, format)) return;
@@ -6515,6 +6624,8 @@ namespace dxvk {
   void DxvkContext::endRenderPass(bool suspend) {
     if (m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
       if (m_qvfr) {
+        m_qvfr->atlasPassEnds += m_qvfr->atlasPass;
+        m_qvfr->atlasPass = false;
         endQvfrTiming(m_qvfr->profileReplay);
         m_qvfr->profileReplay = size_t(-1);
       }
@@ -6705,8 +6816,12 @@ namespace dxvk {
   void DxvkContext::renderPassBindFramebuffer(
     const DxvkFramebufferInfo&  framebufferInfo,
           DxvkRenderPassOps&    ops) {
-    if (unlikely(m_qvfr && m_qvfrBusy))
-      m_qvfr->replayPasses++;
+    if (unlikely(m_qvfr)) {
+      if (m_qvfrBusy) m_qvfr->replayPasses++;
+      const auto& atlas = m_qvfr->cache[m_qvfr->active].atlas;
+      m_qvfr->atlasPass = atlas.color[0].view
+        && framebufferInfo.attachments() == atlas;
+    }
     if (unlikely(m_qvfrTraceEnabled))
       m_qvfrPass++;
     const DxvkFramebufferSize fbSize = framebufferInfo.size();
@@ -7973,6 +8088,8 @@ namespace dxvk {
       // End active render pass and reset load/store ops for the new render targets.
       DxvkFramebufferInfo fbInfo = makeFramebufferInfo(m_state.om.renderTargets);
 
+      if (m_qvfr && m_qvfr->atlasPass)
+        m_qvfr->atlasTargetBreaks++;
       this->endCurrentPass(true);
 
       this->resetRenderPassOps(
@@ -8599,12 +8716,14 @@ namespace dxvk {
                     DxvkContextFlag::DirtyPushData))
       this->updatePushData<VK_PIPELINE_BIND_POINT_COMPUTE>();
 
+    invalidateQvfrGrabWrites(true);
     return true;
   }
   
   
   template<bool Indexed, bool Indirect, bool Resolve>
   bool DxvkContext::commitGraphicsState() {
+    DxvkQvfrCpuDetailScope cpuDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::GraphicsState);
     if (m_flags.test(DxvkContextFlag::GpDirtyPipeline)) {
       if (unlikely(!this->updateGraphicsPipeline()))
         return false;
@@ -8680,6 +8799,7 @@ namespace dxvk {
       // flush barriers afterwards. We will have done full resource tracking,
       // so skipping the global barrier is still fine in that case.
       if (this->checkGraphicsHazards<Indexed, Indirect>()) {
+        if (m_qvfr && m_qvfr->atlasPass) m_qvfr->atlasHazardBreaks++;
         this->endCurrentPass(true);
         this->flushBarriers();
       }
@@ -8740,6 +8860,7 @@ namespace dxvk {
         // Technically it would be sufficient to only restart the secondary
         // command buffer, but this should almost never happen in practice
         // anyway so avoid the complexity and just suspend the render pass.
+        if (m_qvfr && m_qvfr->atlasPass) m_qvfr->atlasDescriptorBreaks++;
         this->endCurrentPass(true);
 
         m_cmd->createDescriptorRange();
@@ -8751,6 +8872,7 @@ namespace dxvk {
       if (unlikely(Resolve && m_implicitResolves.hasPendingResolves())) {
         // If implicit resolves are required for any of the shader bindings, we need
         // to discard all the state setup that we've done so far and try again
+        if (m_qvfr && m_qvfr->atlasPass) m_qvfr->atlasResolveBreaks++;
         this->endCurrentPass(true);
         this->flushImplicitResolves();
 
@@ -8769,6 +8891,7 @@ namespace dxvk {
     if (m_flags.test(DxvkContextFlag::DirtyDrawBuffer) && Indirect)
       this->trackDrawBuffer();
 
+    invalidateQvfrGrabWrites(false);
     return true;
   }
   
@@ -9687,6 +9810,7 @@ namespace dxvk {
 
 
   void DxvkContext::endCurrentCommands() {
+    if (m_qvfr && m_qvfr->atlasPass) m_qvfr->atlasCommandBreaks++;
     endCurrentPass(true);
 
     prepareSharedImages();
@@ -10287,6 +10411,8 @@ namespace dxvk {
       if (!batch[i].image) continue;
       VkImageAspectFlags aspects = batch[i].imageSubresources.aspectMask;
       bool write = batch[i].access & vk::AccessWriteMask;
+      if (!write) noteQvfrHdrForwardRead(*batch[i].image);
+      if (write) invalidateQvfrGrabImage(*batch[i].image);
       // Depth/stencil writes end the retained continuation. Preserve all
       // surviving planes first; color-only writes can refresh just color.
       if (write && (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))

@@ -42,6 +42,13 @@ namespace dxvk::qvfr {
       closed = true;
       return true;
     }
+    // Explicit opt-in only: the caller must validate an eye-local scene draw
+    // returning to the same original attachments after a resolve boundary.
+    bool resume(uint64_t nextFrame) {
+      if (frame != nextFrame || !started || !closed) return false;
+      closed = false;
+      return true;
+    }
     bool allows(uint64_t nextFrame) { enter(nextFrame); return !closed; }
   };
 }

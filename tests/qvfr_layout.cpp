@@ -25,8 +25,24 @@ static void verify(Extent extent, StereoLayout layout, double scale,
   check(p.peripheral.width <= extent.width && p.peripheral.height <= extent.height);
   check(p.focus.width <= extent.width && p.focus.height <= extent.height);
   check(p.peripheral.layers == extent.layers && p.focus.layers == extent.layers);
-  for (auto e : p.eyes) {
+  for (uint32_t eyeIndex = 0; eyeIndex < 2; eyeIndex++) {
+    const auto& e = p.eyes[eyeIndex];
     auto atlas = scratchAtlas(e);
+    auto stereo = scratchAtlas(e, true, eyeIndex);
+    check(stereo.extent.width == atlas.extent.width);
+    check(stereo.extent.height == 2 * atlas.extent.height);
+    check(stereo.peripheral.y == eyeIndex * atlas.extent.height);
+    check(stereo.focus.y == stereo.peripheral.y);
+    check(stereo.peripheral.y + stereo.peripheral.height <= stereo.extent.height);
+    check(stereo.focus.y + stereo.focus.height <= stereo.extent.height);
+    auto other = scratchAtlas(p.eyes[1-eyeIndex], true, 1-eyeIndex);
+    check(stereo.extent.width == other.extent.width && stereo.extent.height == other.extent.height);
+    // Both rows and the low/focus columns must be disjoint, including 1px tiles.
+    check(stereo.peripheral.x + stereo.peripheral.width <= stereo.focus.x);
+    if (!eyeIndex) {
+      check(stereo.peripheral.y + stereo.peripheral.height <= other.peripheral.y);
+      check(stereo.focus.y + stereo.focus.height <= other.focus.y);
+    }
     check(atlas.peripheral.x == 0 && atlas.peripheral.y == 0);
     check(atlas.focus.x == atlas.peripheral.width && atlas.focus.y == 0);
     check(atlas.focus.x + atlas.focus.width == atlas.extent.width);
@@ -86,6 +102,24 @@ static void verify(Extent extent, StereoLayout layout, double scale,
         double v = (double(extent.height) - py) / extent.height;
         near(wide.x + u * wide.width, tile.x + t * tile.width);
         near(wide.y + v * wide.height, tile.y + t * tile.height);
+      }
+      auto shared = replayAtlasViewport(e, e.original, focusPass,
+        e.original.x, e.original.y + e.original.height, e.original.width, -double(e.original.height), &stereo);
+      auto sharedTile = focusPass ? stereo.focus : stereo.peripheral;
+      check(shared.scissor.x == sharedTile.x && shared.scissor.y == sharedTile.y);
+      check(shared.scissor.width == tile.width && shared.scissor.height == tile.height);
+      near(shared.x, ordinary.x);
+      near(shared.y, ordinary.y + stereo.peripheral.y);
+      // Independently project points in the screen crop to shared texels.
+      // The same source rectangles feed color/depth/stencil publication.
+      auto screen = focusPass ? e.composite : e.original;
+      for (double t : {.01, .25, .5, .99}) {
+        double screenX = screen.x + t * screen.width;
+        double screenY = screen.y + t * screen.height;
+        double u = (screenX - e.original.x) / e.original.width;
+        double v = 1.0 - screenY / e.original.height;
+        near(shared.x + u * shared.width, sharedTile.x + t * sharedTile.width);
+        near(shared.y + v * shared.height, sharedTile.y + t * sharedTile.height);
       }
       check(wide.scissor.x == packed.scissor.x && wide.scissor.y == packed.scissor.y);
       check(wide.scissor.width == packed.scissor.width && wide.scissor.height == packed.scissor.height);

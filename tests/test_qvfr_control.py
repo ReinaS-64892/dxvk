@@ -11,6 +11,86 @@ spec.loader.exec_module(control)
 
 
 class ControlTest(unittest.TestCase):
+    def test_resolve_reuse_and_forward_defer_controls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.txt"
+            path.write_text("enabled=on\nunsafe_skip_hdr_return=on\n")
+            self.assertFalse(control.read_settings(path)["resolve_reuse"])
+            self.assertFalse(control.read_settings(path)["unsafe_defer_hdr_forward"])
+            control.update_settings(path, {"resolve_reuse": True, "unsafe_defer_hdr_forward": True})
+            control.write_state(path, False)
+            control.write_state(path, True)
+            result = control.read_settings(path)
+            self.assertTrue(result["resolve_reuse"] and result["unsafe_defer_hdr_forward"])
+            self.assertTrue(result["unsafe_skip_hdr_return"])
+
+    def test_hdr_return_opt_in_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.txt"
+            path.write_text("enabled=on\nunsafe_scene_continue=on\nscale=.25\n")
+            self.assertFalse(control.read_settings(path)["unsafe_skip_hdr_return"])
+            control.update_settings(path, {"unsafe_skip_hdr_return": True})
+            control.write_state(path, False)
+            control.write_state(path, True)
+            result = control.read_settings(path)
+            self.assertTrue(result["unsafe_skip_hdr_return"])
+            self.assertTrue(result["unsafe_scene_continue"])
+            self.assertEqual(result["scale"], .25)
+
+    def test_unsafe_continuation_and_refresh_preserve_other_settings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.txt"
+            path.write_text("enabled=on\nscene_resume_after_resolve=off\n")
+            self.assertFalse(control.read_settings(path)["unsafe_scene_continue"])
+            control.update_settings(path, {"unsafe_scene_continue": True, "unsafe_resolve_refresh_frames": 12})
+            control.write_state(path, False)
+            control.write_state(path, True)
+            result = control.read_settings(path)
+            self.assertTrue(result["unsafe_scene_continue"])
+            self.assertEqual(result["unsafe_resolve_refresh_frames"], 12)
+            self.assertFalse(result["scene_resume_after_resolve"])
+            for value in ("0", "121", "-1", "1.5"):
+                with self.assertRaises(ValueError):
+                    control.parse_settings("unsafe_resolve_refresh_frames=" + value)
+
+    def test_resolve_resume_is_opt_in_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.txt"
+            path.write_text("enabled=on\nprofile=on\n")
+            self.assertFalse(control.read_settings(path)["scene_resume_after_resolve"])
+            control.update_settings(path, {"scene_resume_after_resolve": True})
+            control.write_state(path, False)
+            control.write_state(path, True)
+            result = control.read_settings(path)
+            self.assertTrue(result["scene_resume_after_resolve"])
+            self.assertTrue(result["profile"])
+
+    def test_detail_mode_preserves_master_and_measurement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.txt"
+            path.write_text("enabled=off\nprofile=on\nprofile_passes=full\n")
+            self.assertFalse(control.read_settings(path)["profile_details"])
+            control.update_settings(path, {"profile_details": True})
+            control.write_state(path, True)
+            result = control.read_settings(path)
+            self.assertTrue(result["profile_details"])
+            self.assertTrue(result["profile"])
+            self.assertEqual(result["profile_passes"], "full")
+
+    def test_stereo_atlas_switch_preserves_other_controls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.txt"
+            path.write_text("enabled=on\nscale=.25\nfocus=.125\n")
+            self.assertTrue(control.read_settings(path)["stereo_atlas"])
+            for value in (False, True):
+                control.update_settings(path, {"stereo_atlas": value})
+                control.write_state(path, False)
+                control.write_state(path, True)
+                result = control.read_settings(path)
+                self.assertEqual(result["stereo_atlas"], value)
+                self.assertEqual(result["scale"], .25)
+                self.assertEqual(result["focus"], .125)
+
     def test_layout_has_independent_density_and_screen_coverage(self):
         settings = control.parse_settings("scale=.25\nfocus_scale=.75\nfocus=.125\nprofile_passes=full")
         self.assertEqual(settings["profile_passes"], "full")

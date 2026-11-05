@@ -49,6 +49,16 @@ int main() {
   readOnlyStencil.draw(stencilMayWrite(255, 0, 2, 0));
   readOnlyStencil.draw(stencilMayWrite(255, 0, 0, 0));
   check(readOnlyStencil.stencil); // A later read does not erase earlier writes.
+  SceneCycle resumed;
+  check(!resumed.resume(10));
+  resumed.rendered(10);
+  check(!resumed.resume(10));
+  check(resumed.finish(10));
+  check(!resumed.resume(11)); // An explicit resume never crosses a frame.
+  check(resumed.resume(10) && resumed.allows(10));
+  check(!resumed.resume(10));
+  check(resumed.finish(10) && !resumed.allows(10));
+  check(resumed.allows(11) && !resumed.resume(11));
   SceneCycle scene;
   check(!scene.finish(10)); // Shadow/desktop work before the first scene.
   check(scene.allows(10));

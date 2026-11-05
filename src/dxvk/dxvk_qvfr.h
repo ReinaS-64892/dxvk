@@ -10,6 +10,12 @@
 #include "../util/util_qvfr_unsafe.h"
 #include "../util/util_qvfr_scene.h"
 #include "../util/util_qvfr_control.h"
+#include "../util/util_qvfr_profile.h"
+#include "../util/util_qvfr_stale_resolve.h"
+#include "../util/util_qvfr_grab.h"
+#include "../util/util_qvfr_dependencies.h"
+#include "../util/util_qvfr_hdr_return.h"
+#include "../util/util_qvfr_resolve_reuse.h"
 #include <map>
 #include <set>
 
@@ -22,6 +28,8 @@ namespace dxvk {
     uint64_t frame = 0;
     uint64_t lastUse = 0;
     qvfr::EyePlan plan = {};
+    qvfr::ScratchAtlas placement = {};
+    bool stereoAtlas = false;
     DxvkRenderTargets original;
     DxvkRenderTargets atlas;
     VkFormat colorFormat = VK_FORMAT_UNDEFINED;
@@ -36,12 +44,24 @@ namespace dxvk {
     }
   };
 
+  enum class DxvkQvfrCpuStage : size_t { Prepare, Eligibility, CachePlan, Dependencies, GraphicsState, Focus, Finish, Seed, Publish, Metadata, Count };
+  inline constexpr std::array<const char*, size_t(DxvkQvfrCpuStage::Count)> QvfrCpuStageNames = {
+    "prepare", "eligibility", "cache-plan", "image-dependencies", "graphics-state", "focus-raster", "finish", "seed", "publish", "profile-metadata" };
+  struct DxvkQvfrDrawGroup {
+    std::array<uint64_t, 12> key = {};
+    std::string_view reason, scene, kind;
+    uint64_t batches = 0, draws = 0;
+    std::string metadata;
+  };
+
   struct DxvkQvfrTiming {
     std::string_view phase;
     Rc<DxvkQuery> begin, end;
     std::chrono::steady_clock::time_point cpuBegin;
     double cpuMs = 0;
     uint64_t endTrackingId = 0;
+    std::vector<DxvkQvfrDrawGroup> drawGroups;
+    uint64_t detailBatches = 0, detailDraws = 0, detailDropped = 0;
   };
 
   struct DxvkQvfrVirtualImage {
@@ -67,8 +87,45 @@ namespace dxvk {
     uint16_t samplers = 0;
   };
 
+  struct DxvkQvfrStaleResolve {
+    uint64_t generation = 0;
+    uint64_t sourceDepthCookie = 0;
+    bool supported = false, refreshPending = false;
+    uint64_t refreshFrame = 0;
+    uint64_t sourceCookie = 0, sourceStorage = 0, destinationStorage = 0, lastUse = 0;
+    qvfr::StaleResolvePolicy policy;
+  };
+
   struct DxvkQvfrState {
     bool sceneOnly = true;
+    bool unsafeSceneContinue = false;
+    bool unsafeSkipHdrReturn = false;
+    bool resolveReuse = false, unsafeDeferHdrForward = false;
+    qvfr::ResolveReuseHistory resolveReuseHistory;
+    uint64_t resolveReuseHits = 0, resolveReuseRecords = 0;
+    uint64_t hdrForwardTicket = 0, hdrForwardTracking = 0, hdrForwardDeferred = 0, hdrForwardCancelled = 0;
+    uint64_t hdrForwardCancelledFrame = ~uint64_t(0), hdrForwardCancelledImage = 0, hdrForwardLateReads = 0;
+    qvfr::HdrReturnPath hdrForwardPath;
+    qvfr::HdrReturnHistory hdrReturnHistory;
+    qvfr::HdrReturnPath hdrReturnWriting;
+    uint64_t hdrReturnShaderDraws = 0, hdrReturnCandidates = 0, hdrReturnAttempts = 0, hdrReturnSkipped = 0;
+    uint32_t unsafeResolveRefreshFrames = 8;
+    std::map<uint64_t, DxvkQvfrStaleResolve> staleResolves;
+    qvfr::GrabProvenance grabProvenance;
+    uint64_t grabGeneration = 0, grabLinks = 0, grabIndirectReads = 0, grabTerminals = 0;
+    uint64_t grabShaderProbes = 0, grabShaderSources = 0;
+    std::set<uint64_t> externalResolveCookies;
+    uint64_t unsafeResolveSeen = 0, unsafeResolveCandidates = 0, unsafeResolveReads = 0;
+    uint64_t unsafeResolveScans = 0, unsafeResolveSampledImages = 0;
+    uint64_t dependencyImages = 0, dependencyDuplicates = 0, dependencyUnrelated = 0;
+    std::map<std::string_view, uint64_t> unsafeResolveDecisions, unsafeResolveDecisionLogFrames;
+    uint64_t unsafeResolvesSkipped = 0, unsafeResolveReadersLearned = 0, unsafeResolveRefreshes = 0;
+    bool sceneResumeAfterResolve = false;
+    uint64_t sceneResumeFrame = ~uint64_t(0), sceneResumes = 0;
+    uint32_t sceneResumeCount = 0;
+    uint64_t sceneResumeBlockedFrame = ~uint64_t(0);
+    bool stereoAtlas = true;
+    uint64_t stereoAtlasShares = 0, stereoEyePassKeeps = 0, stereoAtlasFallbacks = 0;
     bool lazyDepthStencil = false;
     bool unsafeSkipImageSeed = false, unsafeSkipStencilSeed = false, unsafeSkipStencilCompose = false;
     uint64_t unsafeImageSeedsSkipped = 0, unsafeStencilSeedsSkipped = 0, unsafeStencilCompositesSkipped = 0;
@@ -77,6 +134,8 @@ namespace dxvk {
     uint64_t unsafeDepthCompositesSkipped = 0, colorSinglePassComposites = 0, colorSinglePassFallbacks = 0;
     qvfr::SceneCycle sceneCycle;
     uint64_t sceneEnds = 0;
+    uint64_t sceneEndReasonFrame = ~uint64_t(0);
+    const char* sceneEndReason = "none";
     uint64_t atlasImagesCreated = 0, atlasRebuilds = 0, atlasSeedReuses = 0;
     uint64_t seedMappingChanged = 0, seedMappingSame = 0;
     uint64_t compatibilityChecks = 0, compatibilityBarriers = 0, compatibilityRelocations = 0;
@@ -123,6 +182,7 @@ namespace dxvk {
     std::string controlPath;
     std::chrono::steady_clock::time_point nextControlPoll = {};
     uint64_t indirectBatches = 0, advancedBatches = 0;
+    uint64_t geometryBatches = 0, tessellationBatches = 0;
     uint64_t instancedBatches = 0, depthRefreshes = 0;
     const char* lastSkip = "draw";
     uint32_t fallbackInstances = 0, fallbackFirstInstance = 0;
@@ -141,6 +201,10 @@ namespace dxvk {
     uint64_t replayedBatches = 0;
     uint64_t replayPasses = 0, pairedInOnePass = 0;
     uint64_t pairPass = ~uint64_t(0);
+    uint64_t directPairs = 0, atlasContinuations = 0, atlasEyeSwitches = 0;
+    uint64_t atlasPassEnds = 0, atlasTargetBreaks = 0, atlasCommandBreaks = 0;
+    uint64_t atlasHazardBreaks = 0, atlasDescriptorBreaks = 0, atlasResolveBreaks = 0;
+    bool atlasPass = false;
     // Reason names are string literals; lookup does not allocate per draw.
     std::map<std::string_view, uint64_t> skipped;
     std::set<std::string_view> targetSkips;
@@ -148,6 +212,11 @@ namespace dxvk {
     uint64_t colorComposites = 0, depthComposites = 0, stencilComposites = 0, stencilBatches = 0;
     bool profile = false, profileClipped = false;
     bool profileFull = false, profileCaptureFull = false;
+    bool profileDetails = false, profileCaptureDetails = false;
+    uint64_t flowFrame = ~uint64_t(0), flowSequence = 0;
+    uint32_t flowEvents = 0, flowDropped = 0;
+    uint32_t profileDetailGroups = 0;
+    qvfr::CpuDetailCollector<size_t(DxvkQvfrCpuStage::Count)> cpuDetail;
     uint64_t cpuProfileFrame = ~uint64_t(0), cpuQvfrCalls = 0, cpuNativeCalls = 0;
     double cpuQvfrMs = 0, cpuNativeMs = 0;
     qvfr::ReplayTimingBudget replayTimingBudget, nativeTimingBudget;
@@ -179,6 +248,14 @@ namespace dxvk {
     ~DxvkQvfrState();
     bool readGaze(std::array<qvfr::Gaze, 2>& result);
     void closeGaze();
+  };
+
+  // Optional, sampled CPU function scopes. Child scope duration is subtracted
+  // from the parent's exclusive time; inclusive values must not be added.
+  struct DxvkQvfrCpuDetailScope {
+    qvfr::CpuDetailCollector<size_t(DxvkQvfrCpuStage::Count)>::Scope scope;
+    DxvkQvfrCpuDetailScope(DxvkQvfrState* q, uint64_t frame, DxvkQvfrCpuStage stage)
+    : scope(q ? &q->cpuDetail : nullptr, q && q->profile && q->profileDetails, frame, size_t(stage)) { }
   };
 
   // Measure only outer application draws; recursive peripheral/focus draws

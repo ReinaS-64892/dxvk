@@ -108,17 +108,20 @@ namespace dxvk::qvfr {
   };
 
   // Two disjoint tiles in one attachment keep both draws in the same pass.
-  // These are per-eye scratch coordinates, independent of stereo packing.
-  inline ScratchAtlas scratchAtlas(const EyePlan& eye) {
-    return {{eye.peripheral.width + eye.focus.width,
-             std::max(eye.peripheral.height, eye.focus.height), 1},
-            {0, 0, eye.peripheral.width, eye.peripheral.height, 0},
-            {eye.peripheral.width, 0, eye.focus.width, eye.focus.height, 0}};
+  // Optional stereo packing stacks the right eye below the left eye, so
+  // changing eyes requires only a viewport/scissor change, not new attachments.
+  inline ScratchAtlas scratchAtlas(const EyePlan& eye, bool stereo = false, uint32_t eyeIndex = 0) {
+    uint32_t rowHeight = std::max(eye.peripheral.height, eye.focus.height);
+    uint32_t y = stereo ? eyeIndex * rowHeight : 0;
+    return {{eye.peripheral.width + eye.focus.width, rowHeight * (stereo ? 2u : 1u), 1},
+            {0, y, eye.peripheral.width, eye.peripheral.height, 0},
+            {eye.peripheral.width, y, eye.focus.width, eye.focus.height, 0}};
   }
 
-  inline ReplayRaster replayAtlasRaster(const EyePlan& eye, Rect scissor, bool focus) {
+  inline ReplayRaster replayAtlasRaster(const EyePlan& eye, Rect scissor, bool focus,
+      const ScratchAtlas* placement = nullptr) {
     auto r = replayRaster(eye, scissor, focus);
-    auto atlas = scratchAtlas(eye);
+    auto atlas = placement ? *placement : scratchAtlas(eye);
     auto tile = focus ? atlas.focus : atlas.peripheral;
     r.x += tile.x;
     r.y += tile.y;
@@ -131,9 +134,9 @@ namespace dxvk::qvfr {
   // a full double-wide postprocess viewport must retain its full width: using
   // a per-eye viewport would repeat its left half in both eyes.
   inline ReplayRaster replayAtlasViewport(const EyePlan& eye, Rect scissor, bool focus,
-      double x, double y, double width, double height) {
-    auto r = replayAtlasRaster(eye, scissor, focus);
-    auto atlas = scratchAtlas(eye);
+      double x, double y, double width, double height, const ScratchAtlas* placement = nullptr) {
+    auto r = replayAtlasRaster(eye, scissor, focus, placement);
+    auto atlas = placement ? *placement : scratchAtlas(eye);
     auto tile = focus ? atlas.focus : atlas.peripheral;
     auto region = focus ? eye.composite : eye.original;
     double sx = double(tile.width) / region.width;

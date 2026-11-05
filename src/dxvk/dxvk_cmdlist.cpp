@@ -397,7 +397,19 @@ namespace dxvk {
   }
   
   
+  void DxvkCommandList::flushQvfrDeferredDraw() {
+    auto draw = m_qvfrDeferredDraw.take();
+    if (!draw.token) return;
+    auto buffer = m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)];
+    if (draw.indexed)
+      m_vkd->vkCmdDrawIndexed(buffer, draw.count, 1, draw.first, draw.vertexOffset, 0);
+    else
+      m_vkd->vkCmdDraw(buffer, draw.count, 1, draw.first, 0);
+    addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
+  }
+
   void DxvkCommandList::finalize() {
+    flushQvfrDeferredDraw();
     // Record commands to upload descriptors if necessary, and
     // reset the descriptor range to not keep it alive for too
     // long. Descriptor ranges are tracked when bound.
@@ -437,6 +449,7 @@ namespace dxvk {
 
 
   void DxvkCommandList::next() {
+    flushQvfrDeferredDraw();
     bool push = m_cmd.sparseBind || m_cmd.execCommands;
 
     for (uint32_t i = 0; i < m_cmd.cmdBuffers.size(); i++) {
@@ -461,6 +474,9 @@ namespace dxvk {
 
   
   void DxvkCommandList::reset() {
+    // Finalization already emitted pending work. Abandoned lists may simply
+    // discard it; never carry a draw into a recycled command buffer.
+    m_qvfrDeferredDraw.pending = {};
     resetCheckpoints();
 
     // We will re-apply heap bindings first thing in a
@@ -885,6 +901,7 @@ namespace dxvk {
 
   void DxvkCommandList::beginSecondaryCommandBuffer(
           VkCommandBufferInheritanceInfo inheritanceInfo) {
+    flushQvfrDeferredDraw();
     VkCommandBufferInheritanceDescriptorHeapInfoEXT heapInheritance = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT };
 
     VkBindHeapInfoEXT samplerHeap = { };
@@ -954,6 +971,7 @@ namespace dxvk {
 
 
   void DxvkCommandList::rebindSamplerHeap() {
+    flushQvfrDeferredDraw();
     // Secondary command buffer must not be active when this gets called
     for (uint32_t i = uint32_t(DxvkCmdBuffer::ExecBuffer); i <= uint32_t(DxvkCmdBuffer::InitBarriers); i++)
       bindSamplerHeap(m_cmd.cmdBuffers[i]);
@@ -961,6 +979,7 @@ namespace dxvk {
 
 
   void DxvkCommandList::rebindResourceHeap() {
+    flushQvfrDeferredDraw();
     // Secondary command buffer must not be active when this gets called
     for (uint32_t i = uint32_t(DxvkCmdBuffer::ExecBuffer); i <= uint32_t(DxvkCmdBuffer::InitBarriers); i++)
       bindResourceHeap(m_cmd.cmdBuffers[i]);
@@ -968,6 +987,7 @@ namespace dxvk {
 
 
   void DxvkCommandList::rebindDescriptorBuffers() {
+    flushQvfrDeferredDraw();
     // Secondary command buffer must not be active when this gets called
     for (uint32_t i = uint32_t(DxvkCmdBuffer::ExecBuffer); i <= uint32_t(DxvkCmdBuffer::InitBuffer); i++)
       bindDescriptorBuffers(m_cmd.cmdBuffers[i]);

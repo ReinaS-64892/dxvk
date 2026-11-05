@@ -3,6 +3,10 @@
 #include "dxvk_qvfr.h"
 #include "../util/util_env.h"
 #include "../util/util_qvfr_control.h"
+#include "../util/util_qvfr_json.h"
+#include <iomanip>
+#include <locale>
+#include <cstring>
 
 #include "buildenv.h"
 #include <charconv>
@@ -192,9 +196,15 @@ namespace dxvk {
     if (m_qvfr->unsafeReplay)
       Logger::info("QVFR strict UNSAFE enabled: retain split, drop unsupported VR draws/compute, publish at learned terminal target or external handoff; post_classification=fullwidth-color-only");
     if (m_qvfr->sceneOnly)
-      Logger::info("QVFR scene-only enabled: safe scene replay, compose at first dependency/fallback, normal until next endFrame; UNSAFE and virtual post disabled");
+      Logger::info("QVFR scene-only enabled: safe scene replay, compose at first dependency/fallback, normal until next endFrame unless resolve-resume is enabled; UNSAFE and virtual post disabled");
+    if (m_qvfr->unsafeSceneContinue)
+      Logger::info("QVFR UNSAFE scene continuation: reuse learned intermediate resolve contents, retain atlas without publication, periodically refresh; known external outputs excluded");
+    if (m_qvfr->sceneResumeAfterResolve)
+      Logger::info("QVFR resolve-resume experiment enabled: same original pair, depth-tested eye viewport, full scene safety checks, max 4 resumes/frame, no resume after external handoff/native scene-target fallback");
     if (m_qvfr->lazyDepthStencil)
       Logger::info("QVFR lazy depth/stencil enabled: publish color at scene-end; retain depth/stencil until access or discard on full clear");
+    Logger::info("QVFR stereo atlas: shared color/depth attachments for both eyes, eye-local rows, runtime stereo_atlas=on/off");
+    Logger::info("QVFR CPU replay: direct pair commits graphics state once, focus updates only raster state; atlas pass continuity/break counters enabled");
     Logger::info("QVFR overhead diagnostics: atlas allocation/rebuild/relocation counters, stencil KEEP writes excluded, closed scene fast path");
     if (m_qvfr->safeInstancing)
       Logger::info("QVFR safe direct instancing enabled: original instance IDs, half-width viewport, scene safety checks; post and indirect excluded");
@@ -232,6 +242,7 @@ namespace dxvk {
     q.scale = settings.scale; q.fraction = settings.focus;
     q.focusScale = q.sceneOnly ? settings.focusScale : 1.0;
     q.profileFull = settings.profilePasses == "full";
+    q.profileDetails = settings.profileDetails;
     q.sharedGaze = settings.gaze == "shared"; q.gazePath = settings.gazeFile;
     q.profile = settings.profile && m_device->queues().graphics.properties.core.queueFamilyProperties.timestampValidBits != 0;
     q.orientationTrace = settings.orientationTrace && !q.unsafeReplay;
@@ -239,6 +250,16 @@ namespace dxvk {
     q.stencilEnabled = settings.stencil && (q.sceneOnly || q.virtualEnabled);
     q.safeInstancing = settings.safeInstancing && q.sceneOnly;
     q.lazyDepthStencil = settings.lazyDepthStencil && q.sceneOnly;
+    q.stereoAtlas = settings.stereoAtlas && q.sceneOnly;
+    q.unsafeSceneContinue = settings.unsafeSceneContinue && q.sceneOnly;
+    q.unsafeSkipHdrReturn = settings.unsafeSkipHdrReturn && q.unsafeSceneContinue;
+    q.resolveReuse = settings.resolveReuse && q.sceneOnly;
+    q.unsafeDeferHdrForward = settings.unsafeDeferHdrForward && q.unsafeSkipHdrReturn;
+    q.resolveReuseHistory = {}; q.hdrForwardTicket = 0;
+    q.hdrForwardCancelledImage = 0;
+    q.hdrReturnHistory = {}; q.hdrReturnWriting = {};
+    q.unsafeResolveRefreshFrames = settings.unsafeResolveRefreshFrames;
+    q.sceneResumeAfterResolve = settings.sceneResumeAfterResolve && q.sceneOnly && !q.unsafeSceneContinue;
     q.unsafeSkipImageSeed = settings.unsafeSkipImageSeed && q.sceneOnly;
     q.unsafeSkipStencilSeed = settings.unsafeSkipStencilSeed && q.sceneOnly;
     q.unsafeSkipStencilCompose = settings.unsafeSkipStencilCompose && q.sceneOnly;
@@ -249,11 +270,15 @@ namespace dxvk {
     q.outlineCycle = {};
     q.controlRequested = settings;
     Logger::info(str::format("QVFR control enabled=", q.enabled, " frame=", m_frameCount,
-      " profile=", q.profile, " orientation_trace=", q.orientationTrace,
+      " profile=", q.profile, " profile_details=", q.profileDetails, " orientation_trace=", q.orientationTrace,
       " gaze=", settings.gaze, " outline=", q.sourceOutline,
       " size=", q.size.width, "x", q.size.height, " samples=", q.samples,
       " format=", q.format, " scale=", q.scale, " focus=", q.fraction,
       " focus_scale=", q.focusScale, " profile_passes=", settings.profilePasses,
+      " stereo_atlas=", q.stereoAtlas, " scene_resume_after_resolve=", q.sceneResumeAfterResolve,
+      " unsafe_scene_continue=", q.unsafeSceneContinue, " unsafe_resolve_refresh_frames=", q.unsafeResolveRefreshFrames,
+      " unsafe_skip_hdr_return=", q.unsafeSkipHdrReturn,
+      " resolve_reuse=", q.resolveReuse, " unsafe_defer_hdr_forward=", q.unsafeDeferHdrForward,
       " stencil=", q.stencilEnabled, " safe_instancing=", q.safeInstancing,
       " lazy_ds=", q.lazyDepthStencil, " unsafe_replay=", q.unsafeReplay,
       " unsafe_skip_image_seed=", q.unsafeSkipImageSeed,
@@ -319,7 +344,7 @@ namespace dxvk {
     VkClearValue nearDepth = {};
     nearDepth.depthStencil.depth = compare == VK_COMPARE_OP_LESS
       || compare == VK_COMPARE_OP_LESS_OR_EQUAL ? 0.0f : 1.0f;
-    for (auto edge : qvfr::outline(qvfr::scratchAtlas(g.plan).focus, 8)) {
+    for (auto edge : qvfr::outline(g.placement.focus, 8)) {
       VkOffset3D offset = {int32_t(edge.x), int32_t(edge.y), 0};
       VkExtent3D extent = {edge.width, edge.height, 1};
       clearImageView(view, offset, extent, VK_IMAGE_ASPECT_COLOR_BIT, cyan);
@@ -387,6 +412,31 @@ namespace dxvk {
     out << "QVFR stats frame=" << m_frameCount << " enabled=" << q.enabled
         << " profile=" << q.profile << " orientation_trace=" << q.orientationTrace
         << " scene_only=" << q.sceneOnly << " lazy_ds=" << q.lazyDepthStencil << " scene_ends=" << q.sceneEnds
+        << " unsafe_scene_continue=" << q.unsafeSceneContinue
+        << " unsafe_skip_hdr_return=" << q.unsafeSkipHdrReturn
+        << " resolve_reuse=" << q.resolveReuse << " resolve_reuse_hits=" << q.resolveReuseHits
+        << " resolve_reuse_records=" << q.resolveReuseRecords
+        << " unsafe_defer_hdr_forward=" << q.unsafeDeferHdrForward
+        << " hdr_forward_deferred=" << q.hdrForwardDeferred << " hdr_forward_cancelled=" << q.hdrForwardCancelled
+        << " hdr_forward_late_reads=" << q.hdrForwardLateReads
+        << " hdr_return_shader_draws=" << q.hdrReturnShaderDraws << " hdr_return_candidates=" << q.hdrReturnCandidates
+        << " hdr_return_attempts=" << q.hdrReturnAttempts << " hdr_return_skipped=" << q.hdrReturnSkipped
+        << " grab_links=" << q.grabLinks << " grab_indirect_reads=" << q.grabIndirectReads
+        << " grab_shader_probes=" << q.grabShaderProbes << " grab_shader_sources=" << q.grabShaderSources
+        << " grab_terminals=" << q.grabTerminals << " grab_history=" << q.grabProvenance.nodes.size()
+        << " unsafe_resolve_seen=" << q.unsafeResolveSeen
+        << " unsafe_resolve_candidates=" << q.unsafeResolveCandidates
+        << " unsafe_resolve_reads=" << q.unsafeResolveReads
+        << " unsafe_resolve_scans=" << q.unsafeResolveScans
+        << " unsafe_resolve_sampled_images=" << q.unsafeResolveSampledImages
+        << " dependency_images=" << q.dependencyImages
+        << " dependency_duplicates=" << q.dependencyDuplicates
+        << " dependency_unrelated=" << q.dependencyUnrelated
+        << " unsafe_resolve_history=" << q.staleResolves.size()
+        << " unsafe_resolves_skipped=" << q.unsafeResolvesSkipped
+        << " unsafe_resolve_readers_learned=" << q.unsafeResolveReadersLearned
+        << " unsafe_resolve_refreshes=" << q.unsafeResolveRefreshes
+        << " scene_resume_after_resolve=" << q.sceneResumeAfterResolve << " scene_resumes=" << q.sceneResumes
         << " replayed_batches=" << q.replayedBatches
         << " composed_groups=" << q.groups
         << " color_composites=" << q.colorComposites << " depth_composites=" << q.depthComposites
@@ -395,9 +445,24 @@ namespace dxvk {
         << " post_passes=" << q.postPasses
         << " instanced_batches=" << q.instancedBatches << " depth_refreshes=" << q.depthRefreshes
         << " indirect_batches=" << q.indirectBatches << " advanced_batches=" << q.advancedBatches
+        << " geometry_batches=" << q.geometryBatches << " tessellation_batches=" << q.tessellationBatches
         << " seeded_groups=" << q.seededGroups << " cache_hits=" << q.cacheHits
         << " color_refreshes=" << q.colorRefreshes
-        << " replay_passes=" << q.replayPasses << " paired_in_one_pass=" << q.pairedInOnePass;
+        << " replay_passes=" << q.replayPasses << " paired_in_one_pass=" << q.pairedInOnePass
+        << " stereo_atlas=" << q.stereoAtlas << " stereo_atlas_shares=" << q.stereoAtlasShares
+        << " stereo_eye_pass_keeps=" << q.stereoEyePassKeeps
+        << " stereo_atlas_fallbacks=" << q.stereoAtlasFallbacks
+        << " direct_pairs=" << q.directPairs << " atlas_continuations=" << q.atlasContinuations
+        << " atlas_eye_switches=" << q.atlasEyeSwitches
+        << " atlas_pass_ends=" << q.atlasPassEnds << " atlas_target_breaks=" << q.atlasTargetBreaks
+        << " atlas_command_breaks=" << q.atlasCommandBreaks
+        << " atlas_hazard_breaks=" << q.atlasHazardBreaks
+        << " atlas_descriptor_breaks=" << q.atlasDescriptorBreaks
+        << " atlas_resolve_breaks=" << q.atlasResolveBreaks
+        << " atlas_other_breaks=" << (q.atlasPassEnds - q.atlasTargetBreaks - q.atlasCommandBreaks
+          - q.atlasHazardBreaks - q.atlasDescriptorBreaks - q.atlasResolveBreaks);
+    for (const auto& [reason, count] : q.unsafeResolveDecisions)
+      out << " unsafe_decision_" << reason << '=' << count;
     for (const auto& entry : q.skipped)
       out << ' ' << entry.first << '=' << entry.second;
     for (const auto& entry : q.compositionReasons)
@@ -433,11 +498,122 @@ namespace dxvk {
         << " color_single_pass_composites=" << q.colorSinglePassComposites
         << " color_single_pass_fallbacks=" << q.colorSinglePassFallbacks;
     out << " retained_depth=" << retainedDepth << " retained_stencil=" << retainedStencil;
+    if (q.flowFrame == m_frameCount)
+      out << " flow_events=" << q.flowEvents << " flow_dropped=" << q.flowDropped;
     Logger::info(out.str());
+    if (q.cpuDetail.frame == m_frameCount)
+      for (size_t i = 0; i < q.cpuDetail.totals.size(); i++) {
+        const auto& detail = q.cpuDetail.totals[i];
+        if (!detail.calls) continue;
+        Logger::info(str::format("QVFR cpu-detail frame=", m_frameCount,
+          " stage=", QvfrCpuStageNames[i], " calls=", detail.calls,
+          " inclusive_ms=", detail.inclusiveMs, " exclusive_ms=", detail.exclusiveMs));
+      }
     if (q.cpuProfileFrame == m_frameCount)
       Logger::info(str::format("QVFR cpu-record frame=", m_frameCount,
         " qvfr_ms=", q.cpuQvfrMs, " qvfr_calls=", q.cpuQvfrCalls,
         " native_ms=", q.cpuNativeMs, " native_calls=", q.cpuNativeCalls));
+  }
+
+  void DxvkContext::noteQvfrProfileDraw(const char* kind, uint32_t count,
+      int64_t instances, uint32_t firstInstance) {
+    if (!m_qvfr || m_qvfrBusy || !count) return;
+    auto& q = *m_qvfr;
+    noteQvfrFlowDraw(kind, count, instances);
+    if (!q.profileCaptureDetails || q.profileFrame != m_frameCount
+     || q.profileReplay == size_t(-1)) return;
+    auto& timing = q.timings[q.profileReplay];
+    if (timing.phase != "native-pass-total" && timing.phase != "native-pass-sample") return;
+    DxvkQvfrCpuDetailScope metadataDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Metadata);
+    timing.detailBatches++;
+    timing.detailDraws += count;
+    const auto& shaders = m_state.gp.shaders;
+    std::array<Rc<DxvkShader>, 5> stages = {shaders.vs, shaders.tcs, shaders.tes, shaders.gs, shaders.fs};
+    const auto& ds = m_state.dyn.depthStencilState;
+    const auto& vp = m_state.vp.viewports[0];
+    const auto& sc = m_state.vp.scissorRects[0];
+    std::array<uint64_t, 12> key = {};
+    for (size_t i = 0; i < stages.size(); i++) key[i] = stages[i] ? DxvkShader::getCookie(stages[i]) : 0;
+    key[5] = m_state.gp.flags.raw();
+    key[6] = uint64_t(ds.depthTest()) | (uint64_t(ds.depthWrite()) << 1)
+      | (uint64_t(ds.stencilTest()) << 2) | (uint64_t(ds.depthCompareOp()) << 3)
+      | (uint64_t(m_state.vp.viewportCount) << 8) | (uint64_t(m_state.gp.state.omBlend[0].colorWriteMask()) << 16);
+    std::memcpy(&key[7], &vp, sizeof(float) * 4); // x/y/width/height, bit-exact key.
+    key[9] = uint64_t(instances);
+    key[10] = firstInstance;
+    key[11] = uint64_t(uint32_t(sc.offset.x)) ^ (uint64_t(uint32_t(sc.offset.y)) << 32);
+    // Include scissor extent too; different clips must not share one snapshot.
+    key[6] ^= uint64_t(sc.extent.width) << 32;
+    key[10] |= uint64_t(sc.extent.height) << 32;
+    std::string_view scene = !q.enabled ? "qvfr-off"
+      : q.sceneCycle.frame != m_frameCount || !q.sceneCycle.started ? "before-scene"
+      : q.sceneCycle.closed ? "after-scene" : "scene-active";
+    std::string_view reason = !q.enabled ? "disabled" : q.lastSkip;
+    if (reason == "draw" && scene == "after-scene") reason = "scene-closed";
+    for (auto& group : timing.drawGroups)
+      if (group.key == key && group.reason == reason && group.scene == scene && group.kind == kind) {
+        group.batches++; group.draws += count;
+        return;
+      }
+    // Metadata is bounded separately from GPU queries. Keep counting calls
+    // even if a pass contains too many different shaders/state combinations.
+    if (timing.drawGroups.size() >= 32 || q.profileDetailGroups >= 4096) {
+      timing.detailDropped++;
+      return;
+    }
+    q.profileDetailGroups++;
+    const auto& rt = m_state.om.framebufferInfo.attachments();
+    auto c = rt.color[0].view, d = rt.depth.view;
+    uint32_t colors = 0;
+    for (const auto& color : rt.color) colors += bool(color.view);
+    bool eyeViewport = m_state.vp.viewportCount == 1
+      && qvfr::isEyeViewport(q.size, vp.x, vp.y, vp.width, vp.height);
+    auto matchingExtent = [&] (const Rc<DxvkImageView>& view) {
+      if (!view) return false;
+      auto size = view->mipLevelExtent(0);
+      return size.width == q.size.width && size.height == q.size.height;
+    };
+    const char* gate = !c ? "missing-color" : !d ? "missing-depth" : colors != 1 ? "multiple-color-targets"
+      : !matchingExtent(c) || !matchingExtent(d) ? "size" : !eyeViewport ? "viewport"
+      : uint32_t(c->info().format) != q.format ? "format"
+      : uint32_t(c->image()->info().sampleCount) != q.samples ? "samples"
+      : m_state.gp.flags.any(DxvkGraphicsPipelineFlag::HasStorageDescriptors,
+          DxvkGraphicsPipelineFlag::HasTransformFeedback, DxvkGraphicsPipelineFlag::HasLayerExport,
+          DxvkGraphicsPipelineFlag::HasRasterizerDiscard, DxvkGraphicsPipelineFlag::HasSampleMaskExport)
+        || (!(q.unsafeReplay || (q.sceneOnly && q.unsafeSceneContinue))
+          && (shaders.gs || shaders.tcs || shaders.tes)) ? "pipeline-features"
+      : "needs-full-validation";
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "\"kind\":" << std::quoted(kind) << ",\"reason\":" << std::quoted(std::string(reason))
+        << ",\"scene\":" << std::quoted(std::string(scene))
+        << ",\"scene_end_reason\":" << std::quoted(q.sceneEndReasonFrame == m_frameCount ? q.sceneEndReason : "none")
+        << ",\"static_gate\":" << std::quoted(gate)
+        << ",\"instances\":" << instances << ",\"first_instance\":" << firstInstance
+        << ",\"pipeline_flags\":" << key[5] << ",\"depth_test\":" << ds.depthTest()
+        << ",\"depth_write\":" << ds.depthWrite() << ",\"stencil_test\":" << ds.stencilTest()
+        << ",\"depth_compare\":" << uint32_t(ds.depthCompareOp())
+        << ",\"viewport_count\":" << m_state.vp.viewportCount << ",\"viewport\":[";
+    auto number = [&] (float value) { if (std::isfinite(value)) out << value; else out << "null"; };
+    number(vp.x); out << ','; number(vp.y); out << ','; number(vp.width); out << ','; number(vp.height);
+    out << "],\"scissor\":[" << sc.offset.x << ',' << sc.offset.y << ',' << sc.extent.width << ',' << sc.extent.height
+        << "],\"colors\":[";
+    auto attachment = [&] (const Rc<DxvkImageView>& view) {
+      if (!view) { out << "null"; return; }
+      auto info = view->info(); auto extent = view->mipLevelExtent(0);
+      qvfr::writeAttachmentJson(out, {uint64_t(view->image()->getResourceId()), uint64_t(view->image()->handle()),
+        uint32_t(info.format), extent.width, extent.height, info.mipIndex, info.layerIndex,
+        info.layerCount, uint32_t(view->image()->info().sampleCount)});
+    };
+    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) { if (i) out << ','; attachment(rt.color[i].view); }
+    out << "],\"depth\":"; attachment(d);
+    out << ",\"shaders\":[";
+    for (size_t i = 0; i < stages.size(); i++) {
+      if (i) out << ',';
+      if (stages[i]) out << std::quoted(stages[i]->debugName()); else out << "null";
+    }
+    out << ']';
+    timing.drawGroups.push_back({key, reason, scene, kind, 1, count, out.str()});
   }
 
   size_t DxvkContext::beginQvfrTiming(const char* phase) {
@@ -448,6 +624,8 @@ namespace dxvk {
     if (q.profileFrame != m_frameCount) {
       q.replayTimingBudget = {}; q.nativeTimingBudget = {};
       q.profileCaptureFull = q.profileFull;
+      q.profileCaptureDetails = q.profileDetails;
+      q.profileDetailGroups = 0;
     }
     q.profileFrame = m_frameCount;
     bool replay = std::string_view(phase) == "replay-pass";
@@ -497,7 +675,10 @@ namespace dxvk {
     uint32_t bits = m_device->queues().graphics.properties.core.queueFamilyProperties.timestampValidBits;
     uint64_t mask = bits >= 64 ? ~uint64_t(0) : (uint64_t(1) << bits) - 1;
     double msPerTick = m_device->properties().core.properties.limits.timestampPeriod / 1e6;
-    for (const auto& timing : q.timings) {
+    struct RankedPass { size_t index; double gpuMs; };
+    std::vector<RankedPass> ranked;
+    for (size_t index = 0; index < q.timings.size(); index++) {
+      const auto& timing = q.timings[index];
       DxvkQueryData begin = {}, end = {};
       auto bs = timing.begin->getData(begin), es = timing.end->getData(end);
       if (bs == DxvkGpuQueryStatus::Pending || es == DxvkGpuQueryStatus::Pending) return;
@@ -507,8 +688,11 @@ namespace dxvk {
         continue;
       }
       total.samples++;
-      total.gpuMs += ((end.timestamp.time - begin.timestamp.time) & mask) * msPerTick;
+      double gpuMs = ((end.timestamp.time - begin.timestamp.time) & mask) * msPerTick;
+      total.gpuMs += gpuMs;
       total.cpuMs += timing.cpuMs;
+      if (q.profileCaptureDetails && (timing.phase == "native-pass-total" || timing.phase == "native-pass-sample"))
+        ranked.push_back({index, gpuMs});
     }
     for (const auto& [phase, total] : totals)
       Logger::info(str::format("QVFR timing frame=", q.profileFrame, " phase=", phase,
@@ -517,12 +701,43 @@ namespace dxvk {
         " replay_samples=", q.replayTimingBudget.samples, " replay_skipped=", q.replayTimingBudget.skipped,
         " native_samples=", q.nativeTimingBudget.samples, " native_skipped=", q.nativeTimingBudget.skipped,
         " profile_passes=", q.profileCaptureFull ? "full" : "sampled"));
+    if (q.profileCaptureDetails) {
+      std::stable_sort(ranked.begin(), ranked.end(), [] (const RankedPass& a, const RankedPass& b) { return a.gpuMs > b.gpuMs; });
+      size_t emitted = std::min(size_t(16), ranked.size());
+      uint64_t metadataDropped = 0, unattributed = 0;
+      for (const auto& pass : ranked) {
+        metadataDropped += q.timings[pass.index].detailDropped;
+        unattributed += q.timings[pass.index].drawGroups.empty();
+      }
+      Logger::info(str::format("QVFR detail-summary frame=", q.profileFrame,
+        " native_passes_ranked=", ranked.size(), " passes_emitted=", emitted,
+        " groups_captured=", q.profileDetailGroups,
+        " metadata_dropped_batches=", metadataDropped, " unattributed_passes=", unattributed,
+        " profile_passes=", q.profileCaptureFull ? "full" : "sampled",
+        " clipped=", q.profileClipped, " native_skipped=", q.nativeTimingBudget.skipped));
+      for (size_t rank = 0; rank < emitted; rank++) {
+        const auto& pass = ranked[rank];
+        const auto& timing = q.timings[pass.index];
+        Logger::info(str::format("QVFR pass-detail {\"frame\":", q.profileFrame,
+          ",\"pass\":", pass.index, ",\"rank\":", rank + 1, ",\"gpu_ms\":", pass.gpuMs,
+          ",\"cpu_ms\":", timing.cpuMs, ",\"batches\":", timing.detailBatches,
+          ",\"draws\":", timing.detailDraws, ",\"groups\":", timing.drawGroups.size(),
+          ",\"dropped_batches\":", timing.detailDropped, "}"));
+        for (size_t i = 0; i < timing.drawGroups.size(); i++) {
+          const auto& group = timing.drawGroups[i];
+          Logger::info(str::format("QVFR draw-group {\"frame\":", q.profileFrame,
+            ",\"pass\":", pass.index, ",\"group\":", i, ",\"batches\":", group.batches,
+            ",\"draws\":", group.draws, ",", group.metadata, "}"));
+        }
+      }
+    }
     q.timings.clear();
     q.profileClipped = false;
   }
 
   void DxvkContext::flushQvfr(const char* reason, VkImageAspectFlags aspects) {
     if (!m_qvfr || m_qvfrBusy) return;
+    if (qvfr::unsafePublishBoundary(reason)) m_qvfr->sceneResumeBlockedFrame = m_frameCount;
     for (size_t i = 0; i < m_qvfr->cache.size(); i++) flushQvfrGroup(i, reason, aspects);
   }
 
@@ -530,6 +745,8 @@ namespace dxvk {
     if (!m_qvfr || m_qvfrBusy || !m_qvfr->sceneOnly) return;
     auto& q = *m_qvfr;
     if (!q.sceneCycle.finish(m_frameCount)) return;
+    q.sceneEndReasonFrame = m_frameCount;
+    q.sceneEndReason = reason;
     // Close before composing. Color is needed by postprocessing now, while
     // private depth/stencil may never be used again before the next clear.
     // Their actual consumers still publish them via the ordinary access hooks.
@@ -567,6 +784,13 @@ namespace dxvk {
     if (deferQvfrPublish(reason)) return;
     auto targets = m_state.om.renderTargets;
     if (m_qvfr->sceneOnly) {
+      // Once a native fallback actually writes the original scene target,
+      // do not re-enter it later in this frame (e.g. depth-tested UI).
+      if (m_qvfr->sceneCycle.frame == m_frameCount && m_qvfr->sceneCycle.closed)
+        for (const auto& group : m_qvfr->cache)
+          if (targets.color[0].view && group.original.color[0].view
+           && targets.color[0].view->image() == group.original.color[0].view->image())
+            m_qvfr->sceneResumeBlockedFrame = m_frameCount;
       if (targets.depth.view) {
         auto extent = targets.depth.view->mipLevelExtent(0);
         if (extent.width == m_qvfr->size.width && extent.height == m_qvfr->size.height)
@@ -647,10 +871,23 @@ namespace dxvk {
   }
 
   void DxvkContext::flushQvfrShaderImages(bool compute) {
+    DxvkQvfrCpuDetailScope cpuDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Dependencies);
     if (!m_qvfr || !m_qvfr->enabled || m_qvfrBusy) return;
     bool pending = !m_qvfr->virtualImages.empty();
     for (const auto& group : m_qvfr->cache) pending |= group.pending.any();
-    if (!pending) return;
+    // Observe candidate reads even when there are no pending planes, and
+    // record rejected reader contexts rather than hiding them behind an early return.
+    const auto& readerVp = m_state.vp.viewports[0];
+    bool sceneReaderShape = !compute && m_state.dyn.depthStencilState.depthTest()
+      && m_state.vp.viewportCount == 1 && qvfr::isEyeViewport(m_qvfr->size,
+        readerVp.x, readerVp.y, readerVp.width, readerVp.height);
+    // Negative reader diagnostics need not add descriptor lookups to every
+    // shadow/post draw. Potential scene readers are always observed; other
+    // contexts are inspected on the existing sampled profile frames only.
+    bool observeResolve = m_qvfr->unsafeSceneContinue && !m_qvfr->staleResolves.empty()
+      && (sceneReaderShape || (m_qvfr->profile && !(m_frameCount % 120)));
+    bool observeCancelledForward = m_qvfr->hdrForwardCancelledFrame == m_frameCount && m_qvfr->hdrForwardCancelledImage;
+    if (!pending && !observeResolve && !observeCancelledForward) return;
     // Only inspect descriptors actually used by the current shader pipeline.
     // Scanning every bound slot would also flush on stale, unused SRVs.
     const DxvkPipelineBindings* layout = nullptr;
@@ -658,10 +895,29 @@ namespace dxvk {
       auto pipeline = lookupComputePipeline(m_state.cp.shaders);
       if (pipeline) layout = pipeline->getLayout();
     } else {
-      auto pipeline = lookupGraphicsPipeline(m_state.gp.shaders);
+      // A clean graphics pipeline already has the layout we need. Avoid a
+      // second pipeline-table lookup for every scene draw.
+      auto pipeline = !m_flags.test(DxvkContextFlag::GpDirtyPipeline)
+        ? m_state.gp.pipeline : lookupGraphicsPipeline(m_state.gp.shaders);
       if (pipeline) layout = pipeline->getLayout();
     }
-    if (!layout) return;
+    if (!layout) {
+      if (observeResolve) ++m_qvfr->unsafeResolveDecisions["reader_no_layout"];
+      return;
+    }
+    // Only these original images can require publication. Ordinary world and
+    // avatar textures used to enter flushQvfrImage and walk every cache slot.
+    // Publishing during this scan can remove dependencies but cannot add new
+    // application images; keep this conservative snapshot for the whole scan.
+    std::array<const DxvkImage*, 8> deferredImages = {};
+    size_t deferredCount = 0;
+    for (const auto& group : m_qvfr->cache) {
+      if (!group.pending.any()) continue;
+      if (group.original.color[0].view) deferredImages[deferredCount++] = group.original.color[0].view->image();
+      if (group.original.depth.view) deferredImages[deferredCount++] = group.original.depth.view->image();
+    }
+    qvfr::ImageReadVisits<> visits;
+    if (observeResolve) m_qvfr->unsafeResolveScans++;
     auto check = [&] (DxvkPipelineBindingRange range) {
       for (uint32_t i = 0; i < range.bindingCount; i++) {
         const auto& binding = range.bindings[i];
@@ -670,11 +926,80 @@ namespace dxvk {
          || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
           auto view = m_resources[binding.getResourceIndex()].imageView;
           if (!view) continue;
-          if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-            flushQvfrView(view.ptr(), compute ? "compute-image" : "shader-image");
-          else
-            flushQvfrImage(view->image(), compute ? "compute-image" : "shader-image",
-              view->info().aspects);
+          auto image = view->image();
+          if (observeCancelledForward) noteQvfrHdrForwardRead(*image);
+          bool sampled = observeResolve && type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+          if (sampled) m_qvfr->unsafeResolveSampledImages++;
+          // Storage access conservatively observes every plane. Read-only
+          // views keep their aspect masks, e.g. depth then stencil separately.
+          auto aspects = type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+            ? image->formatInfo()->aspectMask : view->info().aspects;
+          auto visit = visits.visit(uintptr_t(image), aspects, sampled);
+          if (!visit.aspects && !visit.observe) {
+            m_qvfr->dependencyDuplicates++;
+            continue;
+          }
+          m_qvfr->dependencyImages++;
+          if (visit.observe) {
+            auto& q = *m_qvfr;
+            auto token = qvfrGrabSource(*view->image());
+            auto entry = q.staleResolves.find(token ? token.root : view->image()->cookie());
+            if (entry != q.staleResolves.end()) {
+              if (token && token.hops) q.grabIndirectReads++;
+              q.unsafeResolveReads++;
+              const auto& rt = m_state.om.renderTargets;
+              const auto& vp = m_state.vp.viewports[0];
+              auto color = rt.color[0].view, depth = rt.depth.view;
+              auto shape = [&] (const Rc<DxvkImageView>& v) {
+                if (!v) return false;
+                auto extent = v->mipLevelExtent(0);
+                return v->info().viewType == VK_IMAGE_VIEW_TYPE_2D && v->info().layerCount == 1
+                  && extent.width == q.size.width && extent.height == q.size.height
+                  && uint32_t(v->image()->info().sampleCount) == q.samples;
+              };
+              const char* rejection = qvfr::staleResolveReaderGate(compute,
+                m_state.dyn.depthStencilState.depthTest(), m_state.vp.viewportCount == 1
+                  && qvfr::isEyeViewport(q.size, vp.x, vp.y, vp.width, vp.height),
+                shape(color) && shape(depth) && uint32_t(color->info().format) == q.format,
+                entry->second.sourceCookie, entry->second.sourceDepthCookie,
+                color ? color->image()->cookie() : 0, depth ? depth->image()->cookie() : 0);
+              if (!entry->second.policy.valid) rejection = "reader_uninitialized";
+              if (entry->second.policy.external) rejection = "reader_external";
+              if (!rejection && !entry->second.policy.sceneReader) {
+                entry->second.policy.sceneReader = true;
+                q.unsafeResolveReadersLearned++;
+                Logger::info(str::format("QVFR unsafe-resolve-learn frame=", m_frameCount,
+                  " source_cookie=", entry->second.sourceCookie, " destination_cookie=", entry->first,
+                  " consumer_color=", color->image()->cookie(), " consumer_depth=", depth->image()->cookie(),
+                  " via_cookie=", view->image()->cookie(), " hops=", token.hops,
+                  " skip_supported=", entry->second.supported,
+                  " ps=", m_state.gp.shaders.fs ? m_state.gp.shaders.fs->debugName() : "none"));
+              } else if (rejection) {
+                auto n = ++q.unsafeResolveDecisions[rejection];
+                if (n == 1 || (!(m_frameCount % 120) && q.unsafeResolveDecisionLogFrames[rejection] != m_frameCount)) {
+                  q.unsafeResolveDecisionLogFrames[rejection] = m_frameCount;
+                  Logger::info(str::format("QVFR unsafe-resolve-reader frame=", m_frameCount,
+                    " reason=", rejection, " source_cookie=", entry->second.sourceCookie,
+                    " destination_cookie=", entry->first, " consumer_color=", color ? color->image()->cookie() : 0,
+                    " consumer_depth=", depth ? depth->image()->cookie() : 0,
+                    " consumer_color_format=", color ? uint32_t(color->info().format) : 0,
+                    " consumer_color_extent=", color ? color->mipLevelExtent(0).width : 0, "x", color ? color->mipLevelExtent(0).height : 0,
+                    " consumer_depth_extent=", depth ? depth->mipLevelExtent(0).width : 0, "x", depth ? depth->mipLevelExtent(0).height : 0,
+                    " consumer_color_samples=", color ? uint32_t(color->image()->info().sampleCount) : 0,
+                    " viewport=", vp.x, ",", vp.y, ",", vp.width, ",", vp.height,
+                    " ps=", m_state.gp.shaders.fs ? m_state.gp.shaders.fs->debugName() : "none", " count=", n));
+                }
+              }
+            }
+          }
+          if (!visit.aspects) continue;
+          bool deferred = std::find(deferredImages.begin(), deferredImages.begin() + deferredCount,
+            image) != deferredImages.begin() + deferredCount;
+          if (!deferred && !m_qvfr->virtualImages.count(image)) {
+            m_qvfr->dependencyUnrelated++;
+            continue;
+          }
+          flushQvfrImage(image, compute ? "compute-image" : "shader-image", visit.aspects);
         }
       }
     };
@@ -700,7 +1025,21 @@ namespace dxvk {
   }
 
   void DxvkContext::noteQvfrExternalImage(const DxvkImage& image, VkImageLayout layout) {
-    if (!m_qvfr || layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) return;
+    if (!m_qvfr) return;
+    noteQvfrFlowImage("external", image);
+    noteQvfrHdrForwardRead(image);
+    m_qvfr->hdrReturnHistory.invalidate(image.cookie());
+    m_qvfr->resolveReuseHistory.invalidate(image.cookie());
+    noteQvfrGrabExternal(image);
+    // Any external use blacklists the image, regardless of transition layout.
+    if (m_qvfr->unsafeSceneContinue) {
+      auto cookie = image.cookie();
+      m_qvfr->externalResolveCookies.insert(cookie);
+      if (m_qvfr->externalResolveCookies.size() > 256) m_qvfr->externalResolveCookies.erase(m_qvfr->externalResolveCookies.begin());
+      auto entry = m_qvfr->staleResolves.find(cookie);
+      if (entry != m_qvfr->staleResolves.end()) entry->second.policy.external = true;
+    }
+    if (layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) return;
     m_qvfr->interopTransition = true;
     const auto& info = image.info();
     // Proton transitions the double-wide, resolved eye image before Submit.
@@ -711,6 +1050,7 @@ namespace dxvk {
      && (image.formatInfo()->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
     {
       m_qvfr->outlineCycle.noteSubmission();
+      m_qvfr->sceneResumeBlockedFrame = m_frameCount;
       if (m_qvfr->unsafeReplay) m_qvfr->terminalCycle.submitted(uint64_t(image.getResourceId()));
     }
     auto n = ++m_qvfr->externalReads;
@@ -722,9 +1062,162 @@ namespace dxvk {
       " samples=", uint32_t(info.sampleCount)));
   }
 
-  bool DxvkContext::beginQvfrDraw() {
+  bool DxvkContext::tryQvfrUnsafeSceneResolve(const Rc<DxvkImage>& dst, const Rc<DxvkImage>& src,
+      const VkImageResolve& region, VkFormat format, VkResolveModeFlagBits mode, VkResolveModeFlagBits stencilMode) {
+    if (!m_qvfr || m_qvfrBusy || !m_qvfr->enabled || !m_qvfr->unsafeSceneContinue) return false;
     auto& q = *m_qvfr;
-    if (q.sceneOnly && !q.sceneCycle.allows(m_frameCount)) return false;
+    q.unsafeResolveSeen++;
+    bool knownSource = false, pendingColor = false;
+    uint64_t sourceDepthCookie = 0, sourceDepthLastUse = 0;
+    for (const auto& group : q.cache)
+      if (group.original.color[0].view && group.original.color[0].view->image() == src) {
+        knownSource = true; pendingColor |= group.pending.color;
+        if (group.original.depth.view && group.lastUse >= sourceDepthLastUse) {
+          sourceDepthCookie = group.original.depth.view->image()->cookie();
+          sourceDepthLastUse = group.lastUse;
+        }
+      }
+    auto decision = [&] (const char* reason) {
+      auto n = ++q.unsafeResolveDecisions[reason];
+      if (n != 1 && (m_frameCount % 120 || q.unsafeResolveDecisionLogFrames[reason] == m_frameCount)) return;
+      q.unsafeResolveDecisionLogFrames[reason] = m_frameCount;
+      const auto& si = src->info(); const auto& di = dst->info();
+      Logger::info(str::format("QVFR unsafe-resolve-decision frame=", m_frameCount,
+        " reason=", reason, " count=", n, " source_cookie=", src->cookie(), " destination_cookie=", dst->cookie(),
+        " known_source=", knownSource, " format=", uint32_t(format),
+        " source_format=", uint32_t(si.format), " destination_format=", uint32_t(di.format),
+        " mode=", uint32_t(mode), " stencil_mode=", uint32_t(stencilMode),
+        " source_samples=", uint32_t(si.sampleCount), " destination_samples=", uint32_t(di.sampleCount),
+        " source_extent=", si.extent.width, "x", si.extent.height,
+        " destination_extent=", di.extent.width, "x", di.extent.height,
+        " region=", region.extent.width, "x", region.extent.height, "x", region.extent.depth,
+        " source_offset=", region.srcOffset.x, ",", region.srcOffset.y, ",", region.srcOffset.z,
+        " destination_offset=", region.dstOffset.x, ",", region.dstOffset.y, ",", region.dstOffset.z,
+        " source_aspect=", uint32_t(region.srcSubresource.aspectMask),
+        " destination_aspect=", uint32_t(region.dstSubresource.aspectMask),
+        " source_mip=", region.srcSubresource.mipLevel, " destination_mip=", region.dstSubresource.mipLevel,
+        " source_layer=", region.srcSubresource.baseArrayLayer, " destination_layer=", region.dstSubresource.baseArrayLayer,
+        " source_layers=", region.srcSubresource.layerCount, " destination_layers=", region.dstSubresource.layerCount,
+        " source_image_layers=", si.numLayers, " destination_image_layers=", di.numLayers,
+        " source_resource=", uint64_t(src->getResourceId()), " destination_resource=", uint64_t(dst->getResourceId()),
+        " pending_color=", pendingColor));
+    };
+    // Recognize Unity's mutable HDR backing format as well as the FLOAT view.
+    bool hdrAlias = q.format == uint32_t(VK_FORMAT_R16G16B16A16_SFLOAT)
+      && format == VK_FORMAT_R16G16B16A16_UNORM
+      && src->isViewCompatible(VK_FORMAT_R16G16B16A16_SFLOAT)
+      && dst->isViewCompatible(VK_FORMAT_R16G16B16A16_SFLOAT);
+    const char* rejection = mode != VK_RESOLVE_MODE_AVERAGE_BIT || stencilMode != VK_RESOLVE_MODE_NONE ? "resolve_mode"
+      : uint32_t(format) != q.format && !hdrAlias ? "resolve_format"
+      : src->info().sampleCount == VK_SAMPLE_COUNT_1_BIT || dst->info().sampleCount != VK_SAMPLE_COUNT_1_BIT ? "resolve_samples"
+      : src == dst ? "resolve_self"
+      : region.srcSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || region.dstSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ? "resolve_aspect"
+      : region.srcSubresource.mipLevel || region.dstSubresource.mipLevel
+        || region.srcSubresource.baseArrayLayer || region.dstSubresource.baseArrayLayer
+        || region.srcSubresource.layerCount != 1 || region.dstSubresource.layerCount != 1
+        || src->info().numLayers != 1 || dst->info().numLayers != 1 ? "resolve_subresource"
+      : region.srcOffset.x || region.srcOffset.y || region.srcOffset.z
+        || region.dstOffset.x || region.dstOffset.y || region.dstOffset.z ? "resolve_offset"
+      : region.extent.width != q.size.width || region.extent.height != q.size.height || region.extent.depth != 1
+        || !src->isFullSubresource(region.srcSubresource, region.extent)
+        || !dst->isFullSubresource(region.dstSubresource, region.extent) ? "resolve_extent"
+      : !knownSource ? "resolve_unknown_source" : nullptr;
+    if (rejection) decision(rejection);
+    // Discovery is broader than skip eligibility: keep initialized full-output
+    // color candidates even when e.g. format/extent prevents skipping. Their
+    // actual readers and rejection reasons remain visible in the next trace.
+    bool discover = knownSource && src != dst && src->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
+      && dst->info().sampleCount == VK_SAMPLE_COUNT_1_BIT
+      && region.srcSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+      && region.dstSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
+      && !region.dstOffset.x && !region.dstOffset.y && !region.dstOffset.z
+      && !region.dstSubresource.mipLevel && !region.dstSubresource.baseArrayLayer
+      && region.dstSubresource.layerCount == 1 && dst->info().numLayers == 1
+      && dst->isFullSubresource(region.dstSubresource, region.extent)
+      && mode != VK_RESOLVE_MODE_NONE;
+    if (!discover) return false;
+    auto cookie = dst->cookie();
+    auto it = q.staleResolves.find(cookie);
+    if (it == q.staleResolves.end()) {
+      if (q.staleResolves.size() >= 32) {
+        auto oldest = std::min_element(q.staleResolves.begin(), q.staleResolves.end(),
+          [] (const auto& a, const auto& b) { return a.second.lastUse < b.second.lastUse; });
+        q.staleResolves.erase(oldest);
+      }
+      it = q.staleResolves.emplace(cookie, DxvkQvfrStaleResolve()).first;
+    }
+    auto& entry = it->second;
+    uint64_t sourceStorage = uint64_t(src->getResourceId()), destinationStorage = uint64_t(dst->getResourceId());
+    // Renaming the source allocation does not invalidate the already resolved
+    // destination contents. Only a different source image or destination
+    // storage requires warmup/relearning.
+    if (entry.sourceCookie != src->cookie() || entry.destinationStorage != destinationStorage) {
+      bool external = entry.policy.external;
+      entry = {};
+      entry.generation = ++q.grabGeneration;
+      entry.policy.external = external;
+      entry.sourceCookie = src->cookie(); entry.sourceStorage = sourceStorage; entry.destinationStorage = destinationStorage;
+      q.unsafeResolveCandidates++;
+      Logger::info(str::format("QVFR unsafe-resolve-candidate frame=", m_frameCount,
+        " source_cookie=", src->cookie(), " destination_cookie=", cookie,
+        " supported=", rejection == nullptr, " format=", uint32_t(format)));
+    }
+    entry.sourceStorage = sourceStorage;
+    entry.sourceDepthCookie = sourceDepthCookie;
+    entry.supported = rejection == nullptr;
+    entry.lastUse = m_frameCount;
+    entry.policy.external |= dst->info().shared || q.externalResolveCookies.count(cookie);
+    bool active = q.sceneCycle.frame == m_frameCount && q.sceneCycle.started && !q.sceneCycle.closed
+      && q.sceneResumeBlockedFrame != m_frameCount && pendingColor;
+    if (entry.supported && entry.policy.skip(m_frameCount, q.unsafeResolveRefreshFrames, active)) {
+      auto n = ++q.unsafeResolvesSkipped;
+      if (n <= 16 || !(n % 120))
+        Logger::info(str::format("QVFR unsafe-resolve-skip frame=", m_frameCount,
+          " source_cookie=", src->cookie(), " destination_cookie=", cookie,
+          " age_frames=", m_frameCount - entry.policy.refreshedFrame, " skipped=", n));
+      noteQvfrFlowImage("resolve-skip", *dst, src.ptr());
+      return true; // No publication, copy, clear, resolve or substitute draw.
+    }
+    if (!rejection) decision(!entry.policy.valid ? "resolve_warmup"
+      : entry.policy.external ? "resolve_external" : !entry.policy.sceneReader ? "resolve_no_scene_reader"
+      : !active ? "resolve_inactive_scene" : m_frameCount == entry.policy.refreshedFrame ? "resolve_same_frame"
+      : "resolve_refresh_due");
+    if (entry.policy.valid && entry.policy.sceneReader && !entry.policy.external) q.unsafeResolveRefreshes++;
+    entry.policy.refreshed(m_frameCount);
+    entry.refreshPending = true;
+    entry.refreshFrame = m_frameCount;
+    return false;
+  }
+
+  bool DxvkContext::qvfrSceneAllowsDraw() {
+    auto& q = *m_qvfr;
+    if (q.sceneCycle.allows(m_frameCount)) return true;
+    if (!q.sceneResumeAfterResolve || q.sceneResumeBlockedFrame == m_frameCount
+     || q.sceneEndReasonFrame != m_frameCount
+     || std::string_view(q.sceneEndReason) != "resolve-read"
+     || (q.sceneResumeFrame == m_frameCount && q.sceneResumeCount >= 4)) return false;
+    const auto& vp = m_state.vp.viewports[0];
+    if (!m_state.dyn.depthStencilState.depthTest() || m_state.vp.viewportCount != 1
+     || !qvfr::isEyeViewport(q.size, vp.x, vp.y, vp.width, vp.height)) return false;
+    const auto& rt = m_state.om.renderTargets;
+    // Only a known original pair may re-enter. Postprocess targets, unknown
+    // depth attachments and full-width Y-flip/UI passes keep the old boundary.
+    for (const auto& group : q.cache)
+      if (group.original.color[0].view && group.original.depth.view && group.original == rt) return true;
+    return false;
+  }
+
+  bool DxvkContext::beginQvfrDraw() {
+    DxvkQvfrCpuDetailScope cpuDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Prepare);
+    DxvkQvfrCpuDetailScope eligibilityDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Eligibility);
+    auto& q = *m_qvfr;
+    bool resuming = q.sceneOnly && !q.sceneCycle.allows(m_frameCount);
+    if (resuming && !qvfrSceneAllowsDraw()) return false;
+    // Native draws since publication may have changed the originals. Respect
+    // plane invalidation and import stale data even if unsafe seed skipping was
+    // requested; carry this protection to both eyes for the rest of this frame.
+    bool skipImageSeed = q.unsafeSkipImageSeed && !resuming
+      && !(q.sceneResumeFrame == m_frameCount && q.sceneResumeCount);
     const auto& rt = m_state.om.renderTargets;
     if (!rt.color[0].view || !rt.depth.view) return skipQvfr("missing-attachment");
     if (rt.color[0].shadow || rt.depth.shadow) return skipQvfr("shadow-attachment");
@@ -738,8 +1231,8 @@ namespace dxvk {
     auto c = rt.color[0].view; auto d = rt.depth.view;
     if (q.unsafeReplay && !q.terminalCycle.normal) q.droppedSnapshots += q.virtualImages.erase(c->image());
     else materializeQvfrVirtual(c->image(), "replay-target");
-    auto ck = c->info(); auto dk = d->info();
-    auto ci = c->image()->info(); auto di = d->image()->info();
+    const auto& ck = c->info(); const auto& dk = d->info();
+    const auto& ci = c->image()->info(); const auto& di = d->image()->info();
     if (ck.viewType != VK_IMAGE_VIEW_TYPE_2D || dk.viewType != VK_IMAGE_VIEW_TYPE_2D)
       return skipQvfr("view-type");
     if (ck.mipIndex || dk.mipIndex || ck.layerIndex || dk.layerIndex
@@ -786,10 +1279,15 @@ namespace dxvk {
      || sc.offset.x < 0 || sc.offset.y < 0) return skipQvfr("viewport");
     if (m_flags.test(DxvkContextFlag::GpDirtyPipeline) && !updateGraphicsPipeline())
       return skipQvfr("invalid-pipeline");
+    // The final pre-raster stage (VS/TES/GS) still emits its original clip
+    // positions. Fixed-function viewport/scissor mapping works after any of
+    // these stages; no vertex-only shader rewrite is involved. Keep explicit
+    // output/side-effect checks, since replay emits the application draw twice.
     if (m_state.gp.flags.any(DxvkGraphicsPipelineFlag::HasStorageDescriptors,
         DxvkGraphicsPipelineFlag::HasTransformFeedback, DxvkGraphicsPipelineFlag::HasLayerExport,
         DxvkGraphicsPipelineFlag::HasRasterizerDiscard, DxvkGraphicsPipelineFlag::HasSampleMaskExport)
-     || (!q.unsafeReplay && (m_state.gp.shaders.gs || m_state.gp.shaders.tcs || m_state.gp.shaders.tes)))
+     || (!(q.unsafeReplay || (q.sceneOnly && q.unsafeSceneContinue))
+       && (m_state.gp.shaders.gs || m_state.gp.shaders.tcs || m_state.gp.shaders.tes)))
       return skipQvfr("pipeline-features");
     if (!m_state.gp.shaders.vs || !m_state.gp.shaders.fs) return skipQvfr("missing-shader");
     if (m_state.gp.shaders.vs->metadata().flags.test(DxvkShaderFlag::ExportsViewport)
@@ -800,6 +1298,8 @@ namespace dxvk {
       if (stage && stage->metadata().flags.test(DxvkShaderFlag::ExportsViewport))
         return skipQvfr("shader-outputs");
     uint32_t eye = fullViewport ? q.replayEye : vp.x < float(ew) ? 0 : 1;
+    eligibilityDetail.scope.finish();
+    DxvkQvfrCpuDetailScope cacheDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::CachePlan);
     std::array<qvfr::CacheSlot, 4> slots;
     for (size_t i = 0; i < slots.size(); i++) slots[i] = q.cache[i].slot();
     size_t index = qvfr::chooseDeferredSlot(slots, uintptr_t(c->image()), uintptr_t(d->image()), eye);
@@ -826,24 +1326,47 @@ namespace dxvk {
       if (!q.gazeValid) return skipQvfr("gaze");
       auto plan = qvfr::makeScenePlan(q.size, q.scale, q.fraction, q.frameGaze, q.focusScale);
       if (!plan) return skipQvfr("plan");
-      auto atlas = qvfr::scratchAtlas(plan->eyes[eye]);
+      auto atlas = qvfr::scratchAtlas(plan->eyes[eye], q.stereoAtlas, eye);
       const auto& limits = m_device->properties().core.properties.limits;
-      if (atlas.extent.width > std::min(limits.maxImageDimension2D, limits.maxFramebufferWidth)
-       || atlas.extent.height > std::min(limits.maxImageDimension2D, limits.maxFramebufferHeight))
-        return skipQvfr("atlas-size");
+      auto fits = [&] (const qvfr::ScratchAtlas& a) {
+        return a.extent.width <= std::min(limits.maxImageDimension2D, limits.maxFramebufferWidth)
+            && a.extent.height <= std::min(limits.maxImageDimension2D, limits.maxFramebufferHeight);
+      };
+      bool stereo = q.stereoAtlas && fits(atlas);
+      if (q.stereoAtlas && !stereo) {
+        atlas = qvfr::scratchAtlas(plan->eyes[eye]);
+        q.stereoAtlasFallbacks++;
+      }
+      if (!fits(atlas)) return skipQvfr("atlas-size");
       if (g.atlas.color[0].view) {
         auto a = g.plan.composite, b = plan->eyes[eye].composite;
         if (a.x != b.x || a.y != b.y) q.seedMappingChanged++;
         else q.seedMappingSame++;
       }
       g.plan = plan->eyes[eye]; g.eye = eye; g.frame = m_frameCount;
+      g.placement = atlas; g.stereoAtlas = stereo;
     }
 
+    if (q.atlasPass && m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
+      if (q.active != index && q.cache[q.active].eye != eye) q.atlasEyeSwitches++;
+      if (reuse && m_state.om.framebufferInfo.attachments() == g.atlas
+       && !m_flags.test(DxvkContextFlag::GpRenderPassNeedsFlush)) {
+        q.atlasContinuations++;
+        q.stereoEyePassKeeps += q.active != index && q.cache[q.active].eye != eye;
+      }
+    }
+    cacheDetail.scope.finish();
     q.active = index;
     g.lastUse = ++q.cacheClock;
     m_qvfrBusy = true;
-    q.savedTargets = rt; q.savedVp = m_state.vp;
+    q.savedTargets = rt;
+    // Eligibility above guarantees one viewport; avoid copying all 16 slots.
+    q.savedVp.viewportCount = 1;
+    q.savedVp.viewports[0] = vp;
+    q.savedVp.scissorRects[0] = sc;
+    q.pairPass = ~uint64_t(0);
     if (!reuse) {
+      DxvkQvfrCpuDetailScope seedDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Seed);
       endCurrentPass(true);
       auto timing = beginQvfrTiming("seed");
       prepareShaderReadableImages(false); // Materialize clears before reading original attachments.
@@ -854,17 +1377,42 @@ namespace dxvk {
         m_qvfrBusy = false;
         return skipQvfr("image-usage");
       }
-      auto atlas = qvfr::scratchAtlas(g.plan);
+      auto atlas = g.placement;
       auto low = atlas.peripheral; auto focus = atlas.focus;
-      if (g.colorFormat != ck.format || g.depthFormat != dk.format || g.sampleCount != ci.sampleCount
-       || g.lowW != low.width || g.lowH != low.height || g.focusW != focus.width || g.focusH != focus.height) {
+      auto compatible = [&] (const DxvkQvfrGroup& candidate) {
+        if (!candidate.atlas.color[0].view || !candidate.atlas.depth.view) return false;
+        const auto& extent = candidate.atlas.color[0].view->image()->info().extent;
+        return candidate.colorFormat == ck.format && candidate.depthFormat == dk.format
+            && candidate.sampleCount == ci.sampleCount
+            && candidate.lowW == low.width && candidate.lowH == low.height
+            && candidate.focusW == focus.width && candidate.focusH == focus.height
+            && extent.width == atlas.extent.width && extent.height == atlas.extent.height;
+      };
+      const DxvkQvfrGroup* peer = nullptr;
+      bool foreignOwner = false;
+      for (size_t i = 0; i < q.cache.size(); i++) {
+        if (i == index) continue;
+        const auto& candidate = q.cache[i];
+        // Never share between different original attachment pairs. A cache
+        // eviction may leave the other row alive in a different group.
+        if (g.atlas.color[0].view && candidate.atlas == g.atlas
+         && candidate.original != q.savedTargets) foreignOwner = true;
+        if (g.stereoAtlas && candidate.stereoAtlas && candidate.eye != eye
+         && candidate.original == q.savedTargets && compatible(candidate)) peer = &candidate;
+      }
+      if (peer) {
+        if (g.atlas != peer->atlas) q.stereoAtlasShares++;
+        g.atlas = peer->atlas;
+        q.atlasSeedReuses++;
+      } else if (!compatible(g) || foreignOwner) {
         const char* cause = !g.atlas.color[0].view ? "initial"
           : g.colorFormat != ck.format || g.depthFormat != dk.format ? "format"
           : g.sampleCount != ci.sampleCount ? "samples" : "dimensions";
         q.atlasRebuilds += bool(g.atlas.color[0].view);
         if (q.atlasImagesCreated < 16 || !(q.atlasImagesCreated % 240))
           Logger::info(str::format("QVFR atlas-create frame=", m_frameCount, " slot=", index,
-            " eye=", eye, " cause=", cause, " extent=", atlas.extent.width, "x", atlas.extent.height,
+            " eye=", eye, " cause=", cause, " stereo_atlas=", g.stereoAtlas,
+            " extent=", atlas.extent.width, "x", atlas.extent.height,
             " focus_xy=", g.plan.composite.x, ",", g.plan.composite.y,
             " color_format=", uint32_t(ck.format), " depth_format=", uint32_t(dk.format),
             " samples=", uint32_t(ci.sampleCount)));
@@ -889,12 +1437,12 @@ namespace dxvk {
         qvfr::Rect extent = {0, 0, atlas.extent.width, atlas.extent.height, 0};
         g.atlas.color[0].view = create(ck.format, extent, false);
         g.atlas.depth.view = create(dk.format, extent, true);
-        g.colorFormat = ck.format; g.depthFormat = dk.format; g.sampleCount = ci.sampleCount;
-        g.lowW = low.width; g.lowH = low.height; g.focusW = focus.width; g.focusH = focus.height;
       } else q.atlasSeedReuses++;
+      g.colorFormat = ck.format; g.depthFormat = dk.format; g.sampleCount = ci.sampleCount;
+      g.lowW = low.width; g.lowH = low.height; g.focusW = focus.width; g.focusH = focus.height;
       // Explicitly unsafe: retain previous/initial atlas contents, without a
       // substitute clear. The original attachments are deliberately not imported.
-      if (!q.unsafeSkipImageSeed) {
+      if (!skipImageSeed) {
         stretch(*this, g.atlas.color[0].view, low, c, g.plan.original);
         stretch(*this, g.atlas.depth.view, low, d, g.plan.original);
         copyCrop(*this, g.atlas.color[0].view, focus, c, g.plan.composite);
@@ -907,7 +1455,7 @@ namespace dxvk {
       q.seededGroups++;
       endQvfrTiming(timing);
     } else {
-      if (g.pending.colorStale && q.unsafeSkipImageSeed) {
+      if (g.pending.colorStale && skipImageSeed) {
         g.pending.refreshColor();
         q.unsafeImageSeedsSkipped++;
       }
@@ -915,14 +1463,14 @@ namespace dxvk {
         endCurrentPass(true);
         auto timing = beginQvfrTiming("refresh-color");
         prepareShaderReadableImages(false);
-        auto atlas = qvfr::scratchAtlas(g.plan);
+        auto atlas = g.placement;
         stretch(*this, g.atlas.color[0].view, atlas.peripheral, c, g.plan.original);
         copyCrop(*this, g.atlas.color[0].view, atlas.focus, c, g.plan.composite);
         g.pending.refreshColor();
         q.colorRefreshes++;
         endQvfrTiming(timing);
       }
-      if (g.pending.depthStale && q.unsafeSkipImageSeed) {
+      if (g.pending.depthStale && skipImageSeed) {
         g.pending.refreshDepth();
         q.unsafeImageSeedsSkipped++;
       }
@@ -930,7 +1478,7 @@ namespace dxvk {
         endCurrentPass(true);
         auto timing = beginQvfrTiming("refresh-depth");
         prepareShaderReadableImages(false);
-        auto atlas = qvfr::scratchAtlas(g.plan);
+        auto atlas = g.placement;
         stretch(*this, g.atlas.depth.view, atlas.peripheral, d, g.plan.original);
         copyCrop(*this, g.atlas.depth.view, atlas.focus, d, g.plan.composite);
         g.pending.refreshDepth();
@@ -950,7 +1498,7 @@ namespace dxvk {
       endCurrentPass(true);
       auto timing = beginQvfrTiming("seed-stencil");
       prepareShaderReadableImages(false);
-      auto atlas = qvfr::scratchAtlas(g.plan);
+      auto atlas = g.placement;
       copyQvfrStencil(g.atlas.depth.view, atlas.peripheral, d, g.plan.original);
       copyQvfrStencil(g.atlas.depth.view, atlas.focus, d, g.plan.composite);
       g.stencilValid = true;
@@ -958,16 +1506,33 @@ namespace dxvk {
     }
 
     auto raster = qvfr::replayAtlasViewport(g.plan, {uint32_t(sc.offset.x), uint32_t(sc.offset.y),
-      sc.extent.width, sc.extent.height, 0}, false, vp.x, vp.y, vp.width, vp.height);
+      sc.extent.width, sc.extent.height, 0}, false, vp.x, vp.y, vp.width, vp.height, &g.placement);
     DxvkViewport mapped = {};
     mapped.viewport = {float(raster.x), float(raster.y), float(raster.width), float(raster.height), vp.minDepth, vp.maxDepth};
     mapped.scissor = {{int32_t(raster.scissor.x), int32_t(raster.scissor.y)}, {raster.scissor.width, raster.scissor.height}};
     bindRenderTargets(DxvkRenderTargets(g.atlas), 0);
+    // endQvfrDraw restored logical application targets, while the physical
+    // atlas pass may still be active. Cancel only that redundant target
+    // update; real target changes and pending resolves keep the normal path.
+    if (q.atlasPass && m_flags.test(DxvkContextFlag::GpRenderPassActive)
+     && !m_flags.test(DxvkContextFlag::GpRenderPassNeedsFlush)
+     && m_state.om.framebufferInfo.attachments() == g.atlas)
+      m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
     setViewports(1, &mapped);
+    if (resuming && q.sceneCycle.resume(m_frameCount)) {
+      if (q.sceneResumeFrame != m_frameCount) { q.sceneResumeFrame = m_frameCount; q.sceneResumeCount = 0; }
+      q.sceneResumeCount++;
+      q.sceneResumes++;
+      if (q.sceneResumes <= 16 || !(q.sceneResumes % 120))
+        Logger::info(str::format("QVFR scene-resume frame=", m_frameCount,
+          " reason=resolve-read eye=", eye, " resumes=", q.sceneResumes,
+          " frame_resumes=", q.sceneResumeCount, " stale_image_seed_skip=disabled"));
+    }
     return true;
   }
 
   void DxvkContext::focusQvfrDraw() {
+    DxvkQvfrCpuDetailScope cpuDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Focus);
     auto& q = *m_qvfr;
     auto& g = q.cache[q.active];
     q.pairPass = m_flags.test(DxvkContextFlag::GpRenderPassActive)
@@ -975,15 +1540,15 @@ namespace dxvk {
     const auto& vp = q.savedVp.viewports[0];
     const auto& sc = q.savedVp.scissorRects[0];
     auto raster = qvfr::replayAtlasViewport(g.plan, {uint32_t(sc.offset.x), uint32_t(sc.offset.y),
-      sc.extent.width, sc.extent.height, 0}, true, vp.x, vp.y, vp.width, vp.height);
+      sc.extent.width, sc.extent.height, 0}, true, vp.x, vp.y, vp.width, vp.height, &g.placement);
     DxvkViewport mapped = {};
     mapped.viewport = {float(raster.x), float(raster.y), float(raster.width), float(raster.height), vp.minDepth, vp.maxDepth};
     mapped.scissor = {{int32_t(raster.scissor.x), int32_t(raster.scissor.y)}, {raster.scissor.width, raster.scissor.height}};
-    bindRenderTargets(DxvkRenderTargets(g.atlas), 0);
     setViewports(1, &mapped);
   }
 
   void DxvkContext::endQvfrDraw() {
+    DxvkQvfrCpuDetailScope cpuDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Finish);
     auto& q = *m_qvfr;
     auto& g = q.cache[q.active];
     if (q.pairPass == q.replayPasses && m_flags.test(DxvkContextFlag::GpRenderPassActive))
@@ -1000,12 +1565,22 @@ namespace dxvk {
     q.stencilWriteBatches += stencil;
     q.stencilReadOnlyBatches += ds.stencilTest() && !stencil;
     q.advancedBatches += bool(m_state.gp.shaders.gs || m_state.gp.shaders.tcs || m_state.gp.shaders.tes);
+    q.geometryBatches += bool(m_state.gp.shaders.gs);
+    q.tessellationBatches += bool(m_state.gp.shaders.tcs || m_state.gp.shaders.tes);
+    if ((m_state.gp.shaders.gs && q.geometryBatches == 1)
+     || ((m_state.gp.shaders.tcs || m_state.gp.shaders.tes) && q.tessellationBatches == 1))
+      Logger::info(str::format("QVFR advanced-replay frame=", m_frameCount,
+        " gs=", m_state.gp.shaders.gs ? m_state.gp.shaders.gs->debugName() : "none",
+        " tcs=", m_state.gp.shaders.tcs ? m_state.gp.shaders.tcs->debugName() : "none",
+        " tes=", m_state.gp.shaders.tes ? m_state.gp.shaders.tes->debugName() : "none",
+        " unsafe_scene_continue=", q.unsafeSceneContinue));
     q.replayedBatches++;
     if (q.sceneOnly) q.sceneCycle.rendered(m_frameCount);
     m_qvfrBusy = false;
   }
 
   void DxvkContext::flushQvfrGroup(size_t index, const char* reason, VkImageAspectFlags aspects) {
+    DxvkQvfrCpuDetailScope cpuDetail(m_qvfr.get(), m_frameCount, DxvkQvfrCpuStage::Publish);
     if (!m_qvfr || m_qvfrBusy) return;
     auto& q = *m_qvfr;
     auto& g = q.cache[index];
@@ -1030,12 +1605,15 @@ namespace dxvk {
     bool depth = g.pending.depth && (aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
     bool stencil = g.pending.stencil && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT);
     if (!color && !depth && !stencil) return;
+    if (color) q.hdrReturnHistory.invalidate(g.original.color[0].view->image()->cookie());
+    if (color) q.resolveReuseHistory.invalidate(g.original.color[0].view->image()->cookie());
+    if (color) noteQvfrFlowImage("compose-color", *g.original.color[0].view->image(), g.atlas.color[0].view->image());
     m_qvfrBusy = true;
     auto targets = m_state.om.renderTargets;
     auto viewports = m_state.vp;
     auto feedback = m_state.gp.state.om.feedbackLoop();
     endCurrentPass(true);
-    auto atlas = qvfr::scratchAtlas(g.plan);
+    auto atlas = g.placement;
     auto low = atlas.peripheral; auto focus = atlas.focus;
     // A color-only resolve must not materialize depth or destroy the scratch
     // continuation. Keep both tiles until a real depth dependency or write.
@@ -1131,7 +1709,7 @@ namespace dxvk {
     DxvkDescriptorWrite descriptor = { };
     descriptor.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     descriptor.descriptor = src->getDescriptor();
-    auto atlas = qvfr::scratchAtlas(g.plan);
+    auto atlas = g.placement;
     DxvkMetaBlit::Args args = { };
     args.srcCoord0 = {int32_t(atlas.peripheral.x), int32_t(atlas.peripheral.y), 0};
     args.srcCoord1 = {int32_t(atlas.peripheral.x + atlas.peripheral.width),

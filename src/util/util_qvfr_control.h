@@ -17,8 +17,12 @@ namespace dxvk::qvfr {
   }
 
   struct ControlSettings {
+    bool profileDetails = false, sceneResumeAfterResolve = false, unsafeSceneContinue = false;
+    bool unsafeSkipHdrReturn = false;
+    bool resolveReuse = false, unsafeDeferHdrForward = false;
+    uint32_t unsafeResolveRefreshFrames = 8;
     bool enabled = true, profile = false, orientationTrace = false, outline = true;
-    bool stencil = true, safeInstancing = true, lazyDepthStencil = true;
+    bool stencil = true, safeInstancing = true, lazyDepthStencil = true, stereoAtlas = true;
     bool unsafeSkipImageSeed = false, unsafeSkipStencilSeed = false, unsafeSkipStencilCompose = false;
     bool unsafeSkipDepthCompose = false, colorSinglePass = true;
     uint32_t colorFadePixels = 0;
@@ -28,8 +32,8 @@ namespace dxvk::qvfr {
     std::string profilePasses = "sampled";
     std::string gaze = "shared", gazeFile = "Z:/dev/shm/vrchat_dfr_gaze";
     auto values() const {
-      return std::tie(enabled, profile, orientationTrace, outline, stencil, safeInstancing,
-        lazyDepthStencil, unsafeSkipImageSeed, unsafeSkipStencilSeed, unsafeSkipStencilCompose, unsafeSkipDepthCompose, colorSinglePass, colorFadePixels, size.width, size.height, samples, format, scale, focus, focusScale, profilePasses, gaze, gazeFile);
+      return std::tie(enabled, profile, profileDetails, sceneResumeAfterResolve, unsafeSceneContinue, unsafeSkipHdrReturn, resolveReuse, unsafeDeferHdrForward, unsafeResolveRefreshFrames, orientationTrace, outline, stencil, safeInstancing,
+        lazyDepthStencil, stereoAtlas, unsafeSkipImageSeed, unsafeSkipStencilSeed, unsafeSkipStencilCompose, unsafeSkipDepthCompose, colorSinglePass, colorFadePixels, size.width, size.height, samples, format, scale, focus, focusScale, profilePasses, gaze, gazeFile);
     }
     bool operator==(const ControlSettings& other) const { return values() == other.values(); }
     bool operator!=(const ControlSettings& other) const { return !(*this == other); }
@@ -59,9 +63,16 @@ namespace dxvk::qvfr {
       auto key = trimControl(line.substr(0, eq)), value = trimControl(line.substr(eq+1));
       if (value.empty() || !seen.insert(key).second) return std::nullopt;
       bool* flag = key == "enabled" ? &settings.enabled : key == "profile" ? &settings.profile
+        : key == "profile_details" ? &settings.profileDetails
         : key == "orientation_trace" ? &settings.orientationTrace : key == "outline" ? &settings.outline
         : key == "stencil" ? &settings.stencil : key == "safe_instancing" ? &settings.safeInstancing
         : key == "lazy_depth_stencil" ? &settings.lazyDepthStencil
+        : key == "stereo_atlas" ? &settings.stereoAtlas
+        : key == "scene_resume_after_resolve" ? &settings.sceneResumeAfterResolve
+        : key == "unsafe_scene_continue" ? &settings.unsafeSceneContinue
+        : key == "unsafe_skip_hdr_return" ? &settings.unsafeSkipHdrReturn
+        : key == "resolve_reuse" ? &settings.resolveReuse
+        : key == "unsafe_defer_hdr_forward" ? &settings.unsafeDeferHdrForward
         : key == "unsafe_skip_image_seed" ? &settings.unsafeSkipImageSeed
         : key == "unsafe_skip_stencil_seed" ? &settings.unsafeSkipStencilSeed
         : key == "unsafe_skip_stencil_compose" ? &settings.unsafeSkipStencilCompose
@@ -73,6 +84,10 @@ namespace dxvk::qvfr {
         if (!parsed && value == "false") parsed = false;
         if (!parsed) return std::nullopt;
         *flag = *parsed;
+      } else if (key == "unsafe_resolve_refresh_frames") {
+        auto n = parseUint(value, 120);
+        if (!n || !*n) return std::nullopt;
+        settings.unsafeResolveRefreshFrames = *n;
       } else if (key == "color_fade_pixels") {
         auto n = parseUint(value, 256);
         if (!n) return std::nullopt;

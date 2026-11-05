@@ -1,6 +1,7 @@
 #pragma once
 
 #include <limits>
+#include "../util/util_qvfr_deferred_draw.h"
 
 #include "dxvk_bind_mask.h"
 #include "dxvk_buffer.h"
@@ -829,6 +830,17 @@ namespace dxvk {
     }
     
     
+    // Only a validated QVFR copy draw (instance=1, firstInstance=0) may use
+    // this slot. Any subsequent Vulkan command flushes it before changing
+    // physical state; cancellation is possible only while it remains pending.
+    uint64_t deferQvfrDraw(bool indexed, uint32_t count, uint32_t first, int32_t offset) {
+      if (m_checkpoints) return 0;
+      flushQvfrDeferredDraw();
+      return m_qvfrDeferredDraw.store(indexed, count, first, offset);
+    }
+    bool cancelQvfrDraw(uint64_t token) { return m_qvfrDeferredDraw.cancel(token); }
+    void flushQvfrDeferredDraw();
+
     void cmdDraw(
             uint32_t                vertexCount,
             uint32_t                instanceCount,
@@ -1393,15 +1405,18 @@ namespace dxvk {
     std::vector<DxvkGraphicsPipeline*> m_pipelines;
 
     bool m_descriptorHeapInvalidated = false;
+    qvfr::DeferredDrawSlot m_qvfrDeferredDraw;
 
     std::array<int32_t, uint32_t(DxvkCmdBuffer::Count)> m_checkpointIds = {};
 
-    force_inline VkCommandBuffer getCmdBuffer() const {
+    force_inline VkCommandBuffer getCmdBuffer() {
+      if (unlikely(m_qvfrDeferredDraw.pending.token)) flushQvfrDeferredDraw();
       // Allocation logic will always provide an execution buffer
       return m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)];
     }
 
     force_inline VkCommandBuffer getCmdBuffer(DxvkCmdBuffer cmdBuffer) {
+      if (unlikely(m_qvfrDeferredDraw.pending.token)) flushQvfrDeferredDraw();
       VkCommandBuffer buffer = m_cmd.cmdBuffers[uint32_t(cmdBuffer)];
 
       if (likely(cmdBuffer == DxvkCmdBuffer::ExecBuffer || buffer))

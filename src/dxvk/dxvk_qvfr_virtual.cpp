@@ -134,7 +134,7 @@ namespace dxvk {
     auto atlas=virtualView(image,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,atlasFormat);
     for (uint32_t eye=0;eye<2;eye++) {
       auto old=source ? source->atlas : groups[eye]->atlas.color[0].view;
-      auto local=qvfr::scratchAtlas(eyes[eye]);
+      auto local=source ? qvfr::scratchAtlas(eyes[eye]) : groups[eye]->placement;
       // Use the actual atlas format for RGBA8/sRGB as well as HDR.
       auto copy = [&] (qvfr::Rect to, qvfr::Rect from) {
         if (!resolve) copyVirtualTile(*this,atlas,to,old,from,false);
